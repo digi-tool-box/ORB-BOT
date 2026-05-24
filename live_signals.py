@@ -4,15 +4,32 @@ import pandas as pd
 import pytz
 from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
-load_dotenv()
-# Ab aap os.environ se keys nikal sakte hain
-API_KEY = os.environ.get('API_KEY')
-SECRET_KEY = os.environ.get('SECRET_KEY')
 
+# Load environmental variables from .env file
+load_dotenv()
 
 # --- IMPORT CONFIG ---
-# Note: INITIAL_CAPITAL ko yahan import list mein add kar diya hai
-from config import API_KEY, SECRET_KEY, SYMBOL, INTERVAL, NY_TIMEZONE, NY_OPEN_HOUR, NY_OPEN_MINUTE, SLIPPAGE_PCT, RISK_PER_TRADE_PCT, INITIAL_CAPITAL
+# Hum config se sirf strategy variables mangwa rahe hain. 
+# API keys ko .env se handle karna best practice hai.
+from config import (
+    SYMBOL, 
+    INTERVAL, 
+    NY_TIMEZONE, 
+    NY_OPEN_HOUR, 
+    NY_OPEN_MINUTE, 
+    SLIPPAGE_PCT, 
+    RISK_PER_TRADE_PCT, 
+    INITIAL_CAPITAL
+)
+
+# API Keys fallback mechanism (Pehle .env check karega, nahi mila to config se)
+try:
+    from config import API_KEY as CONFIG_API_KEY, SECRET_KEY as CONFIG_SECRET_KEY
+except ImportError:
+    CONFIG_API_KEY, CONFIG_SECRET_KEY = None, None
+
+API_KEY = os.environ.get('API_KEY') or CONFIG_API_KEY
+SECRET_KEY = os.environ.get('SECRET_KEY') or CONFIG_SECRET_KEY
 
 class LiveORBSignals:
     def __init__(self):
@@ -28,11 +45,8 @@ class LiveORBSignals:
         self.trade_taken = False
         self.position = None
 
-    # --- UPDATED: Helper Function with Slippage & Config Capital ---
     def calculate_quantity(self, entry, stop, side):
         # Slippage adjustment
-        # BUY karte waqt price thoda mehenga milta hai (entry + slippage)
-        # SELL karte waqt price thoda sasta milta hai (entry - slippage)
         slippage_amount = entry * (SLIPPAGE_PCT / 100)
         
         if side == 'BUY':
@@ -40,19 +54,17 @@ class LiveORBSignals:
         else: # SELL
             effective_entry = entry - slippage_amount
             
-        # Dummy capital ki jagah config.py se INITIAL_CAPITAL utha raha hai
         equity = INITIAL_CAPITAL 
         risk_amount = equity * (RISK_PER_TRADE_PCT / 100)
         risk_per_unit = abs(effective_entry - stop)
         
-        # Zero division error se bachne ke liye check
+        # Zero division error safety check
         if risk_per_unit == 0:
             return 0, effective_entry
             
         quantity = risk_amount / risk_per_unit
         return round(quantity, 3), effective_entry
 
-    # --- NEW: Function to execute trade on Binance ---
     async def place_order(self, side, quantity):
         try:
             print(f"🚀 Sending {side} order for {quantity} units to Binance...")
@@ -62,76 +74,92 @@ class LiveORBSignals:
                 type='MARKET',
                 quantity=quantity
             )
-            print(f"✅ Order Placed Successfully: {order['orderId']}")
+            print(f"✅ Order Placed Successfully. OrderID: {order.get('orderId')}")
+            return order
         except Exception as e:
             print(f"❌ Order Placement Error: {e}")
+            return None
 
     async def start(self):
+        if not API_KEY or not SECRET_KEY:
+            print("❌ Error: API_KEY or SECRET_KEY missing! Check .env or config.py")
+            return
+
         print("🔌 Connecting to Binance WebSocket...")
-        # TESTNET ke liye testnet=True karna mat bhoolna
+        # Future trading ke liye testnet=True valid hai futures endpoints par
         self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
         self.bm = BinanceSocketManager(self.client)
         stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
-        print(f"✅ Connected. Waiting for NY session...")
-        async with stream as s:
-            while True:
-                msg = await s.recv()
-                if msg['e'] == 'kline':
-                    kline = msg['k']
-                    self.monitor_live_position(kline)
-                    if kline['x']:
-                        # Yahan await add kiya hai kyunki ab ye async function hai
-                        await self.process_closed_candle(kline)
+        print(f"✅ Connected. Waiting for NY session for {SYMBOL}...")
+        
+        try:
+            async with stream as s:
+                while True:
+                    msg = await s.recv()
+                    # Safe dictionary checking
+                    if msg and msg.get('e') == 'kline':
+                        kline = msg['k']
+                        self.monitor_live_position(kline)
+                        if kline.get('x'): # Agar candle close ho gayi hai
+                            await self.process_closed_candle(kline)
+        except asyncio.CancelledError:
+            print("🛑 Task cancelled, closing connections...")
+        finally:
+            # Gracefully closing client session
+            await self.client.close_connection()
+            print("🔌 Connection Closed Cleanly.")
 
     def monitor_live_position(self, kline):
-        # (Aapka existing logic yahan rahega)
-        if self.position is None: return
+        if self.position is None: 
+            return
         current_price = float(kline['c'])
-        # ... logic ...
-        # Note: Jab SL/TP hit ho, tab bhi order close karne ke liye 'place_order' call karna padega.
+        # Aapka existing trailing ya SL/TP logic yahan aayega...
 
-    # --- UPDATED: Isko 'async def' banaya hai taaki place_order await ho sake ---
     async def process_closed_candle(self, kline):
-        # ─── FIX: VARIABLES INITIALIZATION ─────────────────────────────────────
-        # Inhe shuru mein hi False kar diya taaki Pylance undefined ka error na de
         signal_buy = False
         signal_sell = False
-        # ───────────────────────────────────────────────────────────────────────
-
-        # --- AAPKA EXISTING BREAKOUT LOGIC YAHAN RAHEGA ---
-        # (Yahan aap apna logic likhenge jo conditions match hone par signal_buy ya signal_sell ko True karega)
-        
         current_close = float(kline['c'])
+        
+        # --- AAPKA BREAKOUT LOGIC YAHA AAYEGA ---
+        # Note: self.or_low aur self.or_high check kar lena ki unme value hai ya nahi breakout logic chalne se pehle.
         
         # --- AUTOMATED BUY EXECUTION ---
         if signal_buy and not self.trade_taken:
-            # Entry level current close ko maana, stop loss aapne jo set kiya ho
-            entry_level = current_close
-            stop_level = self.or_low  # Example: Opening Range ka Low
+            if self.or_low is None:
+                print("⚠️ Warning: Cannot buy, self.or_low is not set yet.")
+                return
             
-            # 1. Slippage ke sath quantity calculate karein
+            entry_level = current_close
+            stop_level = self.or_low  
+            
             qty, effective_price = self.calculate_quantity(entry_level, stop_level, 'BUY')
             
             if qty > 0:
-                # 2. Real automated order send karein
-                await self.place_order('BUY', qty)
-                self.trade_taken = True
-                self.position = 'BUY'
+                order_status = await self.place_order('BUY', qty)
+                if order_status:
+                    self.trade_taken = True
+                    self.position = 'BUY'
                 
         # --- AUTOMATED SELL EXECUTION ---
         elif signal_sell and not self.trade_taken:
+            if self.or_high is None:
+                print("⚠️ Warning: Cannot sell, self.or_high is not set yet.")
+                return
+                
             entry_level = current_close
-            stop_level = self.or_high  # Example: Opening Range ka High
+            stop_level = self.or_high  
             
             qty, effective_price = self.calculate_quantity(entry_level, stop_level, 'SELL')
             
             if qty > 0:
-                await self.place_order('SELL', qty)
-                self.trade_taken = True
-                self.position = 'SELL'
-        
-        pass 
+                order_status = await self.place_order('SELL', qty)
+                if order_status:
+                    self.trade_taken = True
+                    self.position = 'SELL'
 
 if __name__ == "__main__":
-    bot = LiveORBSignals()
-    asyncio.run(bot.start())
+    try:
+        bot = LiveORBSignals()
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped manually by user.")
