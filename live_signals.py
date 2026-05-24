@@ -5,14 +5,11 @@ import pytz
 from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
 from keep_alive import keep_alive
-import asyncio
 
-# Local development ke liye .env file load karega (Render par ye line safe rahegi)
+# Local development ke liye .env file load karega
 load_dotenv()
 
 # --- IMPORT CONFIG ---
-# Humne config se API_KEY aur SECRET_KEY ka direct import hata diya hai 
-# taaki Render ke variables override na hon.
 from config import (
     SYMBOL, 
     INTERVAL, 
@@ -25,7 +22,6 @@ from config import (
 )
 
 # ─── RENDER ENVIRONMENT VARIABLES FETCH ──────────────────────────────────
-# Sabse pehle Render/OS ke environment variables check honge.
 API_KEY = os.environ.get('API_KEY')
 SECRET_KEY = os.environ.get('SECRET_KEY')
 
@@ -92,7 +88,7 @@ class LiveORBSignals:
             return
 
         print("🔌 Connecting to Binance WebSocket...")
-        # Note: Agar live trading karni hai to testnet=False ya remove kar dena.
+        # Testnet par trade lagane ke liye testnet=True rakha hai
         self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
         self.bm = BinanceSocketManager(self.client)
         stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
@@ -118,10 +114,35 @@ class LiveORBSignals:
         current_price = float(kline['c'])
 
     async def process_closed_candle(self, kline):
+        current_close = float(kline['c'])
+        current_high = float(kline['h'])
+        current_low = float(kline['l'])
+        
+        # --- AUTOMATIC RANGE INITIALIZATION ---
+        # Agar High/Low set nahi hai, to pehli closed candle ko hum benchmark maan lenge
+        if not self.or_set:
+            self.or_high = current_high
+            self.or_low = current_low
+            self.or_set = True
+            print(f"🎯 Auto-Set Opening Range -> High: {self.or_high}, Low: {self.or_low}")
+            return
+
         signal_buy = False
         signal_sell = False
-        current_close = float(kline['c'])
         
+        # --- AUTOMATIC SIGNAL TRIGGER LOGIC ---
+        # 1. BUY Signal: Agar current close price High ke upar nikal jaye
+        if current_close > self.or_high and not self.breakout_done['BUY']:
+            signal_buy = True
+            self.breakout_done['BUY'] = True
+            print(f"📈 Breakout! Close ({current_close}) > High ({self.or_high}). Generating BUY Signal.")
+
+        # 2. SELL Signal: Agar current close price Low ke neeche nikal jaye
+        elif current_close < self.or_low and not self.breakout_done['SELL']:
+            signal_sell = True
+            self.breakout_done['SELL'] = True
+            print(f"📉 Breakdown! Close ({current_close}) < Low ({self.or_low}). Generating SELL Signal.")
+            
         # --- AUTOMATED BUY EXECUTION ---
         if signal_buy and not self.trade_taken:
             if self.or_low is None:
@@ -155,8 +176,11 @@ class LiveORBSignals:
                     self.position = 'SELL'
 
 if __name__ == "__main__":
+    # 1. Sabse pehle Flask Web Server start hoga background thread me
     print("🌐 Starting Keep Alive Web Server...")
     keep_alive()
+
+    # 2. Uske baad hamara main Binance Async Bot loop chalu hoga
     try:
         bot = LiveORBSignals()
         asyncio.run(bot.start())
