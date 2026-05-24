@@ -18,7 +18,8 @@ from config import (
     NY_OPEN_MINUTE, 
     SLIPPAGE_PCT, 
     RISK_PER_TRADE_PCT, 
-    INITIAL_CAPITAL
+    INITIAL_CAPITAL,
+    LEVERAGE  # <--- Config se leverage import kiya gaya hai
 )
 
 # ─── RENDER ENVIRONMENT VARIABLES FETCH ──────────────────────────────────
@@ -90,6 +91,16 @@ class LiveORBSignals:
         print("🔌 Connecting to Binance WebSocket...")
         # Testnet par trade lagane ke liye testnet=True rakha hai
         self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
+        
+        # --- AUTOMATIC LEVERAGE CONFIGURATION ---
+        try:
+            print(f"⚙️ Setting leverage to {LEVERAGE}x for {SYMBOL}...")
+            await self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+            print(f"✅ Leverage successfully set to {LEVERAGE}x.")
+        except Exception as e:
+            print(f"⚠️ Leverage set karne me dikkat aayi (Ya pehle se set hai): {e}")
+        # ----------------------------------------
+
         self.bm = BinanceSocketManager(self.client)
         stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
         print(f"✅ Connected successfully using Render Keys. Monitoring {SYMBOL}...")
