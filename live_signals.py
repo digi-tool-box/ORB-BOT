@@ -1,7 +1,20 @@
 import asyncio
+import os
 import pandas as pd
 import pytz
 from binance import AsyncClient, BinanceSocketManager
+from dotenv import load_dotenv
+load_dotenv()
+# Ab aap os.environ se keys nikal sakte hain
+API_KEY = os.environ.get('API_KEY')
+SECRET_KEY = os.environ.get('SECRET_KEY')
+SYMBOL = os.environ.get('SYMBOL', 'BTCUSDT')
+INTERVAL = os.environ.get('INTERVAL', '5m')
+NY_TIMEZONE = os.environ.get('NY_TIMEZONE', 'America/New_York')
+
+SLIPPAGE_PCT = float(os.environ.get('SLIPPAGE_PCT', 0.05))
+RISK_PER_TRADE_PCT = float(os.environ.get('RISK_PER_TRADE_PCT', 1.0))
+INITIAL_CAPITAL = float(os.environ.get('INITIAL_CAPITAL', 100.0))
 
 # --- IMPORT CONFIG ---
 # Note: INITIAL_CAPITAL ko yahan import list mein add kar diya hai
