@@ -1,0 +1,9 @@
+python-binance>=1.0.19
+pandas>=2.1.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+python-dotenv>=1.0.0
+pytz>=2023.3
+websocket-client>=1.7.0
+fastapi
+uvicorn
