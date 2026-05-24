@@ -7,13 +7,14 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
+# === Trading pair & Leverage ===
+SYMBOL = "BTCUSDT"
+INTERVAL = "5m"
+LEVERAGE = 5                # <--- Yahan set kiya hai (Testing ke liye 5x safe aur best hai)
+
 # === Backtest period (UTC) ===
 START_DATE = "2025-05-01"
 END_DATE   = "2026-05-21"
-
-# === Trading pair ===
-SYMBOL = "BTCUSDT"
-INTERVAL = "5m"
 
 # === Strategy parameters ===
 BREAKOUT_PCT = 0.5          # 0.5% candle range for valid breakout
@@ -31,12 +32,11 @@ NY_OPEN_MINUTE = 30
 INITIAL_CAPITAL = 100       # USD
 RISK_PER_TRADE_PCT = 1.0    # risk 1% of capital per trade
 
-# === LIVE TRADING INFRASTRUCTURE (Added) ===
+# === LIVE TRADING INFRASTRUCTURE ===
 IS_TESTNET = True           # True for Testnet (Safe Mode), False for Real Money
-LEVERAGE = 10               # Recommended leverage for futures
 QUANTITY_PRECISION = 3      # Precision for BTC (e.g., 0.001)
 
-# === POSITION MANAGEMENT (Added) ===
+# === POSITION MANAGEMENT ===
 # Partial Exit Strategy
 TP1_PCT = 0.5               # 0.5% profit pe 50% position exit (1:1)
 TP2_PCT = 1.0               # 1.0% profit pe remaining position exit (1:2)
