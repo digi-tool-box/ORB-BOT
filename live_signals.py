@@ -155,9 +155,10 @@ class LiveORBSignals:
                     self.position = 'SELL'
 
 if __name__ == "__main__":
+    print("🌐 Starting Keep Alive Web Server...")
+    keep_alive()
     try:
         bot = LiveORBSignals()
         asyncio.run(bot.start())
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped manually.")
-        keep_alive()
+    except Exception as e:
+        print(f"❌ Main Bot Loop Crashed: {e}")
