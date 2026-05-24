@@ -4,6 +4,8 @@ import pandas as pd
 import pytz
 from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
+from keep_alive import keep_alive
+import asyncio
 
 # Local development ke liye .env file load karega (Render par ye line safe rahegi)
 load_dotenv()
@@ -158,3 +160,4 @@ if __name__ == "__main__":
         asyncio.run(bot.start())
     except KeyboardInterrupt:
         print("\n👋 Bot stopped manually.")
+        keep_alive()
