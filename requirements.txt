@@ -5,4 +5,3 @@ python-dotenv>=1.0.0
 pytz>=2023.3
 websocket-client>=1.7.0
 flask>=3.0.0
-gunicorn
