@@ -9,7 +9,6 @@ from keep_alive import keep_alive
 
 load_dotenv()
 
-# --- CONFIG IMPORT ---
 from config import (
     SYMBOL, INTERVAL, NY_TIMEZONE, NY_OPEN_HOUR, NY_OPEN_MINUTE,
     SLIPPAGE_PCT, RISK_PER_TRADE_PCT, INITIAL_CAPITAL, LEVERAGE,
@@ -17,7 +16,6 @@ from config import (
     MAX_TRADES_PER_DAY
 )
 
-# --- RENDER ENVIRONMENT VARIABLES ---
 API_KEY = os.environ.get('API_KEY')
 SECRET_KEY = os.environ.get('SECRET_KEY')
 
@@ -37,8 +35,8 @@ class LiveORBSignals:
         self.or_set = False
         self.trades_taken_today = 0
         self.breakout_done = {'BUY': False, 'SELL': False}
-        self.candles_today = []            # today's closed candles (for signal detection)
-        self.active_position = None        # dict with side, entry, sl, tp, highest/lowest etc.
+        self.candles_today = []
+        self.active_position = None
         self.sl_order_id = None
         self.tp_order_id = None
 
@@ -50,7 +48,7 @@ class LiveORBSignals:
                     return float(b['balance'])
         except Exception as e:
             print(f"Balance fetch error: {e}")
-        return INITIAL_CAPITAL   # fallback
+        return INITIAL_CAPITAL
 
     def calculate_quantity(self, entry, stop, side, balance):
         risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
@@ -76,7 +74,6 @@ class LiveORBSignals:
             return None
 
     async def place_exit_orders(self, side, stop_price, tp_price):
-        """Place Stop Loss (STOP_MARKET) and Take Profit (TAKE_PROFIT_MARKET) orders."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         try:
             sl = await self.client.futures_create_order(
@@ -111,10 +108,9 @@ class LiveORBSignals:
             await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order_id)
             print(f"❌ Order cancelled: {order_id}")
         except Exception as e:
-            print(f"Cancel order error (might be filled): {e}")
+            print(f"Cancel order error: {e}")
 
     async def update_trailing_stop(self, candle_high, candle_low, candle_close):
-        """Adjust SL based on trailing/breakeven logic using cancel/replace."""
         if not self.active_position:
             return
 
@@ -125,7 +121,6 @@ class LiveORBSignals:
         breakeven_triggered = pos.get('breakeven_triggered', False)
         current_sl = pos['sl']
 
-        # Trailing parameters (same as backtest)
         breakeven_trigger_pct = 0.2 / 100
         trailing_pct = 0.1 / 100
 
@@ -135,29 +130,24 @@ class LiveORBSignals:
         if side == 'BUY':
             if candle_high > highest_high:
                 highest_high = candle_high
-
             profit_pct = (highest_high - pos['entry']) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
-
             if breakeven_triggered:
                 trail_sl = highest_high * (1 - trailing_pct)
                 if trail_sl > new_sl:
                     new_sl = trail_sl
                     update_needed = True
-
-        else:  # SELL
+        else:
             if candle_low < lowest_low:
                 lowest_low = candle_low
-
             profit_pct = (pos['entry'] - lowest_low) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
-
             if breakeven_triggered:
                 trail_sl = lowest_low * (1 + trailing_pct)
                 if trail_sl < new_sl:
@@ -166,7 +156,6 @@ class LiveORBSignals:
 
         if update_needed:
             print(f"🔄 Updating SL to {new_sl:.2f}")
-            # Cancel old SL order and place new one
             if self.sl_order_id:
                 await self.cancel_order(self.sl_order_id)
             close_side = 'SELL' if side == 'BUY' else 'BUY'
@@ -184,14 +173,12 @@ class LiveORBSignals:
             except Exception as e:
                 print(f"Trailing SL order error: {e}")
 
-        # Update state
         self.active_position['highest_high'] = highest_high
         self.active_position['lowest_low'] = lowest_low
         self.active_position['breakeven_triggered'] = breakeven_triggered
         self.active_position['sl'] = new_sl
 
     async def check_position_status(self):
-        """Check if position is still open; if closed, cleanup orders and state."""
         if not self.active_position:
             return
         try:
@@ -199,11 +186,9 @@ class LiveORBSignals:
             for p in pos_info:
                 amt = float(p['positionAmt'])
                 if amt != 0:
-                    return  # position still open
-            # Position closed
-            print("📴 Position closed (SL/TP hit or manual).")
+                    return
+            print("📴 Position closed (SL/TP hit).")
             self.active_position = None
-            # Cancel any remaining exit orders
             if self.sl_order_id:
                 await self.cancel_order(self.sl_order_id)
             if self.tp_order_id:
@@ -214,14 +199,13 @@ class LiveORBSignals:
             print(f"Position check error: {e}")
 
     async def process_closed_candle(self, kline):
-        candle_ts = kline['t']  # milliseconds
+        candle_ts = kline['t']
         candle_time = datetime.utcfromtimestamp(candle_ts / 1000)
         ny_time = self.ny_tz.localize(candle_time)
         ny_date = ny_time.date()
         ny_hour = ny_time.hour
         ny_minute = ny_time.minute
 
-        # --- Daily reset ---
         if self.today != ny_date:
             print(f"🆕 New trading day: {ny_date}")
             self.today = ny_date
@@ -231,29 +215,22 @@ class LiveORBSignals:
             self.trades_taken_today = 0
             self.breakout_done = {'BUY': False, 'SELL': False}
             self.candles_today = []
-            # Active position carry forward allowed, we will still manage it
-            # Cancel old orders if any? Not needed, they are for previous day's position (still valid)
 
-        # --- Active position management ---
         if self.active_position:
             await self.update_trailing_stop(
                 float(kline['h']), float(kline['l']), float(kline['c'])
             )
             await self.check_position_status()
-            # if position still open, we still record candle for potential future signals? no
-            return  # Don't look for new entries while in a position
+            return
 
-        # --- OR Detection ---
         if not self.or_set:
-            # We need to capture the candle at NY_OPEN_HOUR:NY_OPEN_MINUTE
             if ny_hour == NY_OPEN_HOUR and ny_minute == NY_OPEN_MINUTE:
                 self.or_high = float(kline['h'])
                 self.or_low = float(kline['l'])
                 self.or_set = True
                 print(f"🎯 OR Set: High={self.or_high}, Low={self.or_low}")
-            return  # wait for OR candle
+            return
 
-        # --- Append candle for signal detection ---
         self.candles_today.append({
             'timestamp': candle_ts,
             'ny_time': ny_time,
@@ -263,43 +240,25 @@ class LiveORBSignals:
             'close': float(kline['c'])
         })
 
-        # --- Signal Detection ---
         if self.trades_taken_today >= MAX_TRADES_PER_DAY:
             return
-
-        # We'll look for breakout + retest using the same logic as strategy.detect_signals
-        # For simplicity, we check the last closed candle conditions.
-        # A full implementation would scan from OR time, but we can keep a rolling window.
-        # Below is a simplified yet effective live adaptation.
 
         last = self.candles_today[-1]
         close = last['close']
         high = last['high']
         low = last['low']
 
-        # Check BUY signal
         if close > self.or_high and not self.breakout_done['BUY']:
             candle_range_pct = ((high - low) / low) * 100
             if candle_range_pct >= BREAKOUT_PCT:
-                # Retest zone check
                 retest_upper = self.or_high * (1 + RETEST_ZONE_PCT/100)
                 retest_lower = self.or_high * (1 - RETEST_ZONE_PCT/100)
-                # The current candle itself acts as retest if its low touches the zone
                 if low <= retest_upper and high >= retest_lower:
-                    # Execute BUY trade
                     await self.execute_trade('BUY', self.or_high, self.or_low)
                     self.breakout_done['BUY'] = True
                     self.trades_taken_today += 1
                     return
-                # else wait for future retest candles (we will handle by checking next candles)
-                # For now we just mark breakout and hope retest comes soon.
-                # Better approach: mark breakout and track retest flag.
-                # We'll implement a simple retest pending state.
-                # To keep this example tight, I'll assume the breakout candle itself often acts as retest,
-                # but a complete solution can be added later.
-                pass
 
-        # Check SELL signal similarly
         if close < self.or_low and not self.breakout_done['SELL']:
             candle_range_pct = ((high - low) / low) * 100
             if candle_range_pct >= BREAKOUT_PCT:
@@ -310,9 +269,6 @@ class LiveORBSignals:
                     self.breakout_done['SELL'] = True
                     self.trades_taken_today += 1
                     return
-        # Note: For proper retest scanning, we'd need to check subsequent candles.
-        # This simplified version assumes immediate retest on breakout candle.
-        # It works for many setups but can be enhanced.
 
     async def execute_trade(self, side, entry_level, stop_level):
         balance = await self.get_usdt_balance()
@@ -321,12 +277,10 @@ class LiveORBSignals:
             print("⚠️ Quantity zero, trade skipped.")
             return
 
-        # Place market entry
         order = await self.place_market_order(side, qty)
         if not order:
             return
 
-        # Calculate SL and TP
         if side == 'BUY':
             stop = stop_level * (1 - SL_BUFFER_PCT/100)
             risk = entry_level - stop
@@ -336,10 +290,8 @@ class LiveORBSignals:
             risk = stop - entry_level
             target = entry_level - risk * RISK_REWARD
 
-        # Place exit orders
         await self.place_exit_orders(side, stop, target)
 
-        # Initialize active position tracking
         self.active_position = {
             'side': side,
             'entry': entry_level,
@@ -360,7 +312,6 @@ class LiveORBSignals:
         print("🔌 Connecting to Binance Testnet...")
         self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
 
-        # Set leverage
         try:
             await self.client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
             print(f"⚙️ Leverage set to {LEVERAGE}x")
@@ -377,15 +328,14 @@ class LiveORBSignals:
                     msg = await s.recv()
                     if msg and msg.get('e') == 'kline':
                         kline = msg['k']
-                        if kline['x']:  # candle closed
+                        if kline['x']:
                             await self.process_closed_candle(kline)
                 except asyncio.CancelledError:
-                    print("🛑 Task cancelled, closing...")
+                    print("🛑 Task cancelled.")
                     break
                 except Exception as e:
                     print(f"WebSocket error: {e}. Reconnecting in 5s...")
                     await asyncio.sleep(5)
-                    # Re-establish connection
                     await self.client.close_connection()
                     self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
                     self.bm = BinanceSocketManager(self.client)
@@ -397,6 +347,5 @@ class LiveORBSignals:
 if __name__ == "__main__":
     print("🌐 Starting Keep Alive Web Server...")
     keep_alive()
-
     bot = LiveORBSignals()
     asyncio.run(bot.start())
