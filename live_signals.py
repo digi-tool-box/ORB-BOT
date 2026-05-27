@@ -273,8 +273,8 @@ class LiveORBSignals:
 
     async def process_closed_candle(self, kline):
         try:
-            candle_ts = kline['t']
-            candle_time = datetime.utcfromtimestamp(candle_ts / 1000)
+            candle_close_ts = kline['T']
+            candle_time = datetime.utcfromtimestamp(candle_close_ts / 1000)
             ny_time = self.ny_tz.localize(candle_time)
             ny_date = ny_time.date()
             ny_hour = ny_time.hour
