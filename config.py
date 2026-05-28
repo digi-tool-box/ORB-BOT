@@ -35,6 +35,7 @@ RISK_PER_TRADE_PCT = 1.0    # risk 1% of capital per trade
 # === LIVE TRADING INFRASTRUCTURE ===
 IS_TESTNET = True           # True for Testnet (Safe Mode), False for Real Money
 QUANTITY_PRECISION = 3      # Precision for BTC (e.g., 0.001)
+PRICE_PRECISION = 2         # Precision for BTC price (e.g., 50000.00)
 
 # === POSITION MANAGEMENT ===
 # Partial Exit Strategy
