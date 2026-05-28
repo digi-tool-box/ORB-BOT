@@ -606,7 +606,7 @@ class LiveORBSignals:
             print("🔍 Recovering trades taken today...")
             sys.stdout.flush()
             
-            now_utc = datetime.utcnow()
+            now_utc = datetime.now(pytz.utc)
             today_start_utc = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=pytz.utc)
             start_time_ms = int(today_start_utc.timestamp() * 1000)
             
