@@ -14,7 +14,7 @@ from config import (
     SYMBOL, INTERVAL, NY_TIMEZONE, NY_OPEN_HOUR, NY_OPEN_MINUTE,
     SLIPPAGE_PCT, RISK_PER_TRADE_PCT, INITIAL_CAPITAL, LEVERAGE,
     BREAKOUT_PCT, RETEST_ZONE_PCT, RISK_REWARD, SL_BUFFER_PCT,
-    MAX_TRADES_PER_DAY, DEBUG_MODE
+    MAX_TRADES_PER_DAY, DEBUG_MODE, QUANTITY_PRECISION, PRICE_PRECISION
 )
 
 API_KEY = os.environ.get('API_KEY')
@@ -36,6 +36,7 @@ class LiveORBSignals:
         self.or_set = False
         self.trades_taken_today = 0
         self.breakout_done = {'BUY': False, 'SELL': False}
+        self.breakout_detected = {'BUY': False, 'SELL': False}
         self.candles_today = []
         self.active_position = None
         self.sl_order_id = None
@@ -66,7 +67,7 @@ class LiveORBSignals:
         qty = risk_amount / risk_per_unit
         print(f"📊 Qty Calc: Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
-        return round(qty, 3)
+        return round(qty, QUANTITY_PRECISION)
 
     async def place_market_order(self, side, quantity):
         try:
@@ -88,6 +89,7 @@ class LiveORBSignals:
 
     async def place_exit_orders(self, side, stop_price, tp_price):
         close_side = 'SELL' if side == 'BUY' else 'BUY'
+        sl_success = False
         
         # Place Stop Loss
         try:
@@ -97,13 +99,14 @@ class LiveORBSignals:
                 symbol=SYMBOL,
                 side=close_side,
                 type='STOP_MARKET',
-                stopPrice=round(stop_price, 2),
+                stopPrice=round(stop_price, PRICE_PRECISION),
                 closePosition=True,
                 timeInForce='GTC'
             )
             self.sl_order_id = sl['orderId']
             print(f"✅ SL placed successfully! ID: {sl['orderId']}, Price: {stop_price:.2f}")
             sys.stdout.flush()
+            sl_success = True
         except Exception as e:
             print(f"❌ SL order error: {e}")
             sys.stdout.flush()
@@ -116,7 +119,7 @@ class LiveORBSignals:
                 symbol=SYMBOL,
                 side=close_side,
                 type='TAKE_PROFIT_MARKET',
-                stopPrice=round(tp_price, 2),
+                stopPrice=round(tp_price, PRICE_PRECISION),
                 closePosition=True,
                 timeInForce='GTC'
             )
@@ -126,6 +129,8 @@ class LiveORBSignals:
         except Exception as e:
             print(f"❌ TP order error: {e}")
             sys.stdout.flush()
+            
+        return sl_success
 
     async def cancel_order(self, order_id):
         if not order_id:
@@ -219,7 +224,7 @@ class LiveORBSignals:
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    stopPrice=round(new_sl, 2),
+                    stopPrice=round(new_sl, PRICE_PRECISION),
                     closePosition=True,
                     timeInForce='GTC'
                 )
@@ -274,8 +279,9 @@ class LiveORBSignals:
     async def process_closed_candle(self, kline):
         try:
             candle_close_ts = kline['T']
-            candle_time = datetime.utcfromtimestamp(candle_close_ts / 1000)
-            ny_time = self.ny_tz.localize(candle_time)
+            # Convert millisecond timestamp to localized UTC, then convert to NY time
+            utc_time = datetime.fromtimestamp(candle_close_ts / 1000, tz=pytz.utc)
+            ny_time = utc_time.astimezone(self.ny_tz)
             ny_date = ny_time.date()
             ny_hour = ny_time.hour
             ny_minute = ny_time.minute
@@ -292,6 +298,7 @@ class LiveORBSignals:
                 self.or_low = None
                 self.trades_taken_today = 0
                 self.breakout_done = {'BUY': False, 'SELL': False}
+                self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
 
             # If we have an active position, manage it
@@ -316,7 +323,7 @@ class LiveORBSignals:
 
             # Store candle for potential signal detection
             self.candles_today.append({
-                'timestamp': candle_ts,
+                'timestamp': candle_close_ts,
                 'ny_time': ny_time,
                 'open': float(kline['o']),
                 'high': float(kline['h']),
@@ -335,45 +342,55 @@ class LiveORBSignals:
             low = last['low']
             candle_range_pct = ((high - low) / low) * 100
 
-            # BUY Signal Check
-            if close > self.or_high and not self.breakout_done['BUY']:
+            # 1. Detect Breakouts
+            # BUY Breakout check
+            if close > self.or_high and not self.breakout_detected['BUY'] and not self.breakout_done['BUY']:
                 if candle_range_pct >= BREAKOUT_PCT:
-                    retest_upper = self.or_high * (1 + RETEST_ZONE_PCT/100)
-                    retest_lower = self.or_high * (1 - RETEST_ZONE_PCT/100)
-                    
-                    if low <= retest_upper and high >= retest_lower:
-                        print(f"\n{'!'*50}")
-                        print(f"🚀 BUY SIGNAL DETECTED!")
-                        print(f"   Close: {close:.2f} > OR High: {self.or_high:.2f}")
-                        print(f"   Range: {candle_range_pct:.2f}% (Min: {BREAKOUT_PCT}%)")
-                        print(f"   Retest Zone: {retest_lower:.2f} - {retest_upper:.2f}")
-                        print(f"{'!'*50}")
-                        sys.stdout.flush()
-                        
-                        await self.execute_trade('BUY', self.or_high, self.or_low)
-                        self.breakout_done['BUY'] = True
-                        self.trades_taken_today += 1
-                        return
+                    self.breakout_detected['BUY'] = True
+                    print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Waiting for retest...")
+                    sys.stdout.flush()
 
-            # SELL Signal Check
-            if close < self.or_low and not self.breakout_done['SELL']:
+            # SELL Breakout check
+            if close < self.or_low and not self.breakout_detected['SELL'] and not self.breakout_done['SELL']:
                 if candle_range_pct >= BREAKOUT_PCT:
-                    retest_upper = self.or_low * (1 + RETEST_ZONE_PCT/100)
-                    retest_lower = self.or_low * (1 - RETEST_ZONE_PCT/100)
+                    self.breakout_detected['SELL'] = True
+                    print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Waiting for retest...")
+                    sys.stdout.flush()
+
+            # 2. Detect Retests
+            # BUY Retest check
+            if self.breakout_detected['BUY'] and not self.breakout_done['BUY']:
+                retest_upper = self.or_high * (1 + RETEST_ZONE_PCT/100)
+                retest_lower = self.or_high * (1 - RETEST_ZONE_PCT/100)
+                if low <= retest_upper and high >= retest_lower:
+                    print(f"\n{'!'*50}")
+                    print(f"🚀 BUY RETEST SIGNAL DETECTED!")
+                    print(f"   Low: {low:.2f} <= Retest Upper: {retest_upper:.2f}")
+                    print(f"   High: {high:.2f} >= Retest Lower: {retest_lower:.2f}")
+                    print(f"{'!'*50}")
+                    sys.stdout.flush()
                     
-                    if high >= retest_lower and low <= retest_upper:
-                        print(f"\n{'!'*50}")
-                        print(f"🔻 SELL SIGNAL DETECTED!")
-                        print(f"   Close: {close:.2f} < OR Low: {self.or_low:.2f}")
-                        print(f"   Range: {candle_range_pct:.2f}% (Min: {BREAKOUT_PCT}%)")
-                        print(f"   Retest Zone: {retest_lower:.2f} - {retest_upper:.2f}")
-                        print(f"{'!'*50}")
-                        sys.stdout.flush()
-                        
-                        await self.execute_trade('SELL', self.or_low, self.or_high)
-                        self.breakout_done['SELL'] = True
-                        self.trades_taken_today += 1
-                        return
+                    await self.execute_trade('BUY', self.or_high, self.or_low)
+                    self.breakout_done['BUY'] = True
+                    self.trades_taken_today += 1
+                    return
+
+            # SELL Retest check
+            if self.breakout_detected['SELL'] and not self.breakout_done['SELL']:
+                retest_upper = self.or_low * (1 + RETEST_ZONE_PCT/100)
+                retest_lower = self.or_low * (1 - RETEST_ZONE_PCT/100)
+                if high >= retest_lower and low <= retest_upper:
+                    print(f"\n{'!'*50}")
+                    print(f"🔻 SELL RETEST SIGNAL DETECTED!")
+                    print(f"   High: {high:.2f} >= Retest Lower: {retest_lower:.2f}")
+                    print(f"   Low: {low:.2f} <= Retest Upper: {retest_upper:.2f}")
+                    print(f"{'!'*50}")
+                    sys.stdout.flush()
+                    
+                    await self.execute_trade('SELL', self.or_low, self.or_high)
+                    self.breakout_done['SELL'] = True
+                    self.trades_taken_today += 1
+                    return
 
         except Exception as e:
             print(f"❌ Error processing candle: {e}")
@@ -413,7 +430,28 @@ class LiveORBSignals:
         sys.stdout.flush()
 
         # Place exit orders
-        await self.place_exit_orders(side, stop, target)
+        sl_placed = await self.place_exit_orders(side, stop, target)
+        
+        if not sl_placed:
+            print("🚨 CRITICAL: Stop Loss order failed to place! Initiating emergency market exit...")
+            sys.stdout.flush()
+            exit_side = 'SELL' if side == 'BUY' else 'BUY'
+            try:
+                await self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=exit_side,
+                    type='MARKET',
+                    quantity=qty
+                )
+                print("🚨 Emergency market exit order placed successfully!")
+            except Exception as e:
+                print(f"🚨 CRITICAL ERROR: Emergency exit failed! Manual intervention required! Error: {e}")
+            sys.stdout.flush()
+            
+            if self.tp_order_id:
+                await self.cancel_order(self.tp_order_id)
+                self.tp_order_id = None
+            return
 
         # Track active position
         self.active_position = {
@@ -429,6 +467,163 @@ class LiveORBSignals:
         print(f"\n✅ {side} POSITION ACTIVE - Monitoring...")
         print(f"{'='*50}\n")
         sys.stdout.flush()
+
+    async def recover_opening_range(self):
+        try:
+            print("🔍 Attempting to recover Opening Range (OR) from historical candles...")
+            sys.stdout.flush()
+            
+            klines = await self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=100)
+            
+            now_ny = datetime.now(self.ny_tz)
+            today_date = now_ny.date()
+            self.today = today_date
+            
+            today_candles = []
+            or_candle = None
+            
+            for k in klines:
+                close_time_ms = k[6]
+                utc_time = datetime.fromtimestamp(close_time_ms / 1000, tz=pytz.utc)
+                ny_time = utc_time.astimezone(self.ny_tz)
+                
+                if ny_time.date() == today_date:
+                    candle_data = {
+                        'timestamp': k[0],
+                        'ny_time': ny_time,
+                        'open': float(k[1]),
+                        'high': float(k[2]),
+                        'low': float(k[3]),
+                        'close': float(k[4])
+                    }
+                    today_candles.append(candle_data)
+                    
+                    if ny_time.hour == NY_OPEN_HOUR and ny_time.minute == NY_OPEN_MINUTE:
+                        or_candle = candle_data
+
+            if or_candle:
+                self.or_high = or_candle['high']
+                self.or_low = or_candle['low']
+                self.or_set = True
+                print(f"🎯 Recovered OR from history:")
+                print(f"   📈 OR High: {self.or_high:.2f}")
+                print(f"   📉 OR Low:  {self.or_low:.2f}")
+                sys.stdout.flush()
+                
+                or_idx = today_candles.index(or_candle)
+                self.candles_today = today_candles[or_idx + 1:]
+                print(f"📚 Loaded {len(self.candles_today)} post-OR candles from history")
+                sys.stdout.flush()
+                
+                for candle in self.candles_today:
+                    close = candle['close']
+                    high = candle['high']
+                    low = candle['low']
+                    candle_range_pct = ((high - low) / low) * 100
+                    
+                    if close > self.or_high and not self.breakout_detected['BUY']:
+                        if candle_range_pct >= BREAKOUT_PCT:
+                            self.breakout_detected['BUY'] = True
+                            print(f"📈 [Recovery] Detected BUY Breakout on candle at {candle['ny_time'].strftime('%H:%M')}")
+                            sys.stdout.flush()
+                            
+                    if close < self.or_low and not self.breakout_detected['SELL']:
+                        if candle_range_pct >= BREAKOUT_PCT:
+                            self.breakout_detected['SELL'] = True
+                            print(f"📉 [Recovery] Detected SELL Breakout on candle at {candle['ny_time'].strftime('%H:%M')}")
+                            sys.stdout.flush()
+            else:
+                print("ℹ️ Opening Range candle not found in history (market not open yet or older than 100 candles)")
+                sys.stdout.flush()
+                
+        except Exception as e:
+            print(f"⚠️ Error recovering Opening Range: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+
+    async def recover_active_position(self):
+        try:
+            print("🔍 Checking for open positions on Binance Futures...")
+            sys.stdout.flush()
+            pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+            
+            active_amt = 0.0
+            entry_price = 0.0
+            
+            for p in pos_info:
+                amt = float(p['positionAmt'])
+                if amt != 0:
+                    active_amt = amt
+                    entry_price = float(p['entryPrice'])
+                    break
+            
+            if active_amt != 0.0:
+                side = 'BUY' if active_amt > 0 else 'SELL'
+                print(f"📦 Active Position found: {side} {abs(active_amt)} {SYMBOL} @ {entry_price:.2f}")
+                sys.stdout.flush()
+                
+                open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+                sl_price = None
+                tp_price = None
+                
+                for o in open_orders:
+                    o_type = o['type']
+                    o_side = o['side']
+                    expected_exit_side = 'SELL' if side == 'BUY' else 'BUY'
+                    
+                    if o_side == expected_exit_side:
+                        if o_type == 'STOP_MARKET':
+                            self.sl_order_id = o['orderId']
+                            sl_price = float(o['stopPrice'])
+                        elif o_type == 'TAKE_PROFIT_MARKET':
+                            self.tp_order_id = o['orderId']
+                            tp_price = float(o['stopPrice'])
+                
+                print(f"   🛑 Sync SL: OrderID={self.sl_order_id}, Price={sl_price if sl_price else 'N/A'}")
+                print(f"   🎯 Sync TP: OrderID={self.tp_order_id}, Price={tp_price if tp_price else 'N/A'}")
+                sys.stdout.flush()
+                
+                self.active_position = {
+                    'side': side,
+                    'entry': entry_price,
+                    'sl': sl_price if sl_price else entry_price,
+                    'tp': tp_price if tp_price else entry_price,
+                    'highest_high': entry_price,
+                    'lowest_low': entry_price,
+                    'breakeven_triggered': False
+                }
+            else:
+                print("ℹ️ No active positions found")
+                sys.stdout.flush()
+                
+        except Exception as e:
+            print(f"⚠️ Error recovering active position: {e}")
+            sys.stdout.flush()
+
+    async def recover_trade_count(self):
+        try:
+            print("🔍 Recovering trades taken today...")
+            sys.stdout.flush()
+            
+            now_utc = datetime.utcnow()
+            today_start_utc = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=pytz.utc)
+            start_time_ms = int(today_start_utc.timestamp() * 1000)
+            
+            all_orders = await self.client.futures_get_all_orders(symbol=SYMBOL, startTime=start_time_ms)
+            
+            entry_trades = 0
+            for o in all_orders:
+                if o['status'] == 'FILLED' and o['type'] == 'MARKET':
+                    entry_trades += 1
+            
+            self.trades_taken_today = entry_trades
+            print(f"📊 Recovered Trade Count: {self.trades_taken_today} entry trades today")
+            sys.stdout.flush()
+            
+        except Exception as e:
+            print(f"⚠️ Error recovering trade count: {e}")
+            sys.stdout.flush()
 
     async def start(self):
         try:
@@ -465,6 +660,11 @@ class LiveORBSignals:
             except Exception as e:
                 print(f"⚠️ Leverage setting warning: {e}")
                 sys.stdout.flush()
+
+            # Run startup recoveries
+            await self.recover_opening_range()
+            await self.recover_active_position()
+            await self.recover_trade_count()
 
             # Get account info
             balance = await self.get_usdt_balance()
