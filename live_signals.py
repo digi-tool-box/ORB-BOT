@@ -278,9 +278,9 @@ class LiveORBSignals:
 
     async def process_closed_candle(self, kline):
         try:
-            candle_close_ts = kline['T']
+            candle_open_ts = kline['t']
             # Convert millisecond timestamp to localized UTC, then convert to NY time
-            utc_time = datetime.fromtimestamp(candle_close_ts / 1000, tz=pytz.utc)
+            utc_time = datetime.fromtimestamp(candle_open_ts / 1000, tz=pytz.utc)
             ny_time = utc_time.astimezone(self.ny_tz)
             ny_date = ny_time.date()
             ny_hour = ny_time.hour
@@ -323,7 +323,7 @@ class LiveORBSignals:
 
             # Store candle for potential signal detection
             self.candles_today.append({
-                'timestamp': candle_close_ts,
+                'timestamp': candle_open_ts,
                 'ny_time': ny_time,
                 'open': float(kline['o']),
                 'high': float(kline['h']),
@@ -483,8 +483,8 @@ class LiveORBSignals:
             or_candle = None
             
             for k in klines:
-                close_time_ms = k[6]
-                utc_time = datetime.fromtimestamp(close_time_ms / 1000, tz=pytz.utc)
+                open_time_ms = k[0]
+                utc_time = datetime.fromtimestamp(open_time_ms / 1000, tz=pytz.utc)
                 ny_time = utc_time.astimezone(self.ny_tz)
                 
                 if ny_time.date() == today_date:
