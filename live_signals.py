@@ -476,6 +476,7 @@ class LiveORBSignals:
             klines = await self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=100)
             
             now_ny = datetime.now(self.ny_tz)
+            now_utc_ts_ms = datetime.now(pytz.utc).timestamp() * 1000
             today_date = now_ny.date()
             self.today = today_date
             
@@ -484,6 +485,7 @@ class LiveORBSignals:
             
             for k in klines:
                 open_time_ms = k[0]
+                close_time_ms = k[6]
                 utc_time = datetime.fromtimestamp(open_time_ms / 1000, tz=pytz.utc)
                 ny_time = utc_time.astimezone(self.ny_tz)
                 
@@ -496,10 +498,13 @@ class LiveORBSignals:
                         'low': float(k[3]),
                         'close': float(k[4])
                     }
-                    today_candles.append(candle_data)
                     
-                    if ny_time.hour == NY_OPEN_HOUR and ny_time.minute == NY_OPEN_MINUTE:
-                        or_candle = candle_data
+                    # Only consider fully closed candles for history recovery
+                    if now_utc_ts_ms > close_time_ms:
+                        today_candles.append(candle_data)
+                        
+                        if ny_time.hour == NY_OPEN_HOUR and ny_time.minute == NY_OPEN_MINUTE:
+                            or_candle = candle_data
 
             if or_candle:
                 self.or_high = or_candle['high']
