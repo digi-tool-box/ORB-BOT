@@ -738,7 +738,7 @@ class LiveORBSignals:
                                     print(f"📨 First WebSocket message received! Type: {msg.get('e', 'unknown')}")
                                     sys.stdout.flush()
                                 
-                                if msg and msg.get('e') == 'kline':
+                                if msg['e'] in ['kline', 'continuous_kline']:
                                     kline = msg['k']
                                     
                                     # Periodic heartbeat log (every 60 messages ≈ every 5 min)
