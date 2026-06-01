@@ -286,6 +286,15 @@ class LiveORBSignals:
             ny_hour = ny_time.hour
             ny_minute = ny_time.minute
 
+            # === CRITICAL: Log EVERY closed candle so we can see data is flowing ===
+            close_price = float(kline['c'])
+            high_price = float(kline['h'])
+            low_price = float(kline['l'])
+            print(f"🕯️ Candle Closed: {ny_time.strftime('%Y-%m-%d %H:%M')} NY | "
+                  f"H:{high_price:.2f} L:{low_price:.2f} C:{close_price:.2f} | "
+                  f"OR:{'SET' if self.or_set else 'WAITING'}")
+            sys.stdout.flush()
+
             # Daily reset at new NY session
             if self.today != ny_date:
                 print(f"\n{'='*50}")
@@ -304,7 +313,7 @@ class LiveORBSignals:
             # If we have an active position, manage it
             if self.active_position:
                 await self.update_trailing_stop(
-                    float(kline['h']), float(kline['l']), float(kline['c'])
+                    high_price, low_price, close_price
                 )
                 await self.check_position_status()
                 return
@@ -312,12 +321,15 @@ class LiveORBSignals:
             # Detect OR candle (09:30 NY time)
             if not self.or_set:
                 if ny_hour == NY_OPEN_HOUR and ny_minute == NY_OPEN_MINUTE:
-                    self.or_high = float(kline['h'])
-                    self.or_low = float(kline['l'])
+                    self.or_high = high_price
+                    self.or_low = low_price
                     self.or_set = True
                     print(f"🎯 Opening Range Set!")
                     print(f"   📈 OR High: {self.or_high:.2f}")
                     print(f"   📉 OR Low:  {self.or_low:.2f}")
+                    sys.stdout.flush()
+                else:
+                    print(f"   ⏳ Waiting for 09:30 NY candle... (current: {ny_hour:02d}:{ny_minute:02d})")
                     sys.stdout.flush()
                 return
 
@@ -676,48 +688,116 @@ class LiveORBSignals:
             print(f"💰 Account Balance: {balance:.2f} USDT")
             sys.stdout.flush()
 
+            # === CONNECTIVITY TEST: Verify we can actually get candle data ===
+            try:
+                test_klines = await self.client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=1)
+                if test_klines:
+                    test_open_ms = test_klines[0][0]
+                    test_utc = datetime.fromtimestamp(test_open_ms / 1000, tz=pytz.utc)
+                    test_ny = test_utc.astimezone(self.ny_tz)
+                    print(f"✅ Connectivity Test PASSED! Latest candle: {test_ny.strftime('%Y-%m-%d %H:%M')} NY, Close: {test_klines[0][4]}")
+                else:
+                    print(f"⚠️ Connectivity Test: Got empty response from REST API!")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"❌ Connectivity Test FAILED: {e}")
+                sys.stdout.flush()
+
             print(f"📡 Starting WebSocket stream for {SYMBOL} {INTERVAL}...")
             sys.stdout.flush()
             
-            self.bm = BinanceSocketManager(self.client)
-            stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
-            
-            print("✅ Stream connected! Waiting for NY Session OR candle...")
             print(f"⏰ NY Session: {NY_OPEN_HOUR:02d}:{NY_OPEN_MINUTE:02d} {NY_TIMEZONE}")
+            ny_now = datetime.now(self.ny_tz)
+            ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+            print(f"🕐 Current NY Time: {ny_now.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"🕐 Current IST Time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
             print("="*50 + "\n")
             sys.stdout.flush()
 
-            async with stream as s:
-                while True:
-                    try:
-                        msg = await s.recv()
-                        if msg and msg.get('e') == 'kline':
-                            kline = msg['k']
-                            if kline['x']:  # Candle closed
-                                await self.process_closed_candle(kline)
-                    except asyncio.CancelledError:
-                        print("🛑 Bot shutdown requested")
-                        sys.stdout.flush()
-                        break
-                    except Exception as e:
-                        print(f"⚠️ WebSocket error: {e}")
-                        print("🔄 Reconnecting in 5 seconds...")
-                        sys.stdout.flush()
-                        await asyncio.sleep(5)
-                        
-                        # Reconnect
-                        try:
-                            await self.client.close_connection()
-                            self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
-                            self.bm = BinanceSocketManager(self.client)
-                            stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
-                            print("✅ Reconnected successfully!")
-                            sys.stdout.flush()
-                        except Exception as reconnect_error:
-                            print(f"❌ Reconnection failed: {reconnect_error}")
-                            sys.stdout.flush()
-                            await asyncio.sleep(10)
-                        continue
+            # Outer retry loop — each iteration creates a fresh WebSocket connection
+            RECV_TIMEOUT = 360  # 6 minutes; we expect data every ~few seconds on 5m candles
+            last_msg_count = 0
+            candles_processed = 0
+
+            while True:
+                try:
+                    self.bm = BinanceSocketManager(self.client)
+                    stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
+                    
+                    print("✅ Stream connected! Waiting for candle data...")
+                    sys.stdout.flush()
+
+                    async with stream as s:
+                        while True:
+                            try:
+                                msg = await asyncio.wait_for(s.recv(), timeout=RECV_TIMEOUT)
+                                last_msg_count += 1
+                                
+                                # Log the FIRST message to confirm WebSocket is alive
+                                if last_msg_count == 1:
+                                    print(f"📨 First WebSocket message received! Type: {msg.get('e', 'unknown')}")
+                                    sys.stdout.flush()
+                                
+                                if msg and msg.get('e') == 'kline':
+                                    kline = msg['k']
+                                    
+                                    # Periodic heartbeat log (every 60 messages ≈ every 5 min)
+                                    if last_msg_count % 60 == 0:
+                                        ny_now = datetime.now(self.ny_tz)
+                                        print(f"💓 Heartbeat: {ny_now.strftime('%H:%M:%S')} NY | "
+                                              f"msgs={last_msg_count} | candles={candles_processed} | "
+                                              f"OR={'SET' if self.or_set else 'WAITING'} | "
+                                              f"pos={'ACTIVE' if self.active_position else 'NONE'}")
+                                        sys.stdout.flush()
+                                    
+                                    if kline['x']:  # Candle closed
+                                        candles_processed += 1
+                                        await self.process_closed_candle(kline)
+                                elif msg:
+                                    # Log unexpected message types
+                                    print(f"⚠️ Non-kline message: {str(msg)[:200]}")
+                                    sys.stdout.flush()
+                                        
+                            except asyncio.TimeoutError:
+                                print(f"⚠️ No WebSocket data for {RECV_TIMEOUT}s! Connection likely dead.")
+                                print("🔄 Breaking out to reconnect...")
+                                sys.stdout.flush()
+                                break  # Break inner loop to trigger reconnect in outer loop
+                                
+                            except asyncio.CancelledError:
+                                print("🛑 Bot shutdown requested")
+                                sys.stdout.flush()
+                                return  # Exit the entire start() method
+
+                except asyncio.CancelledError:
+                    print("🛑 Bot shutdown requested")
+                    sys.stdout.flush()
+                    return
+
+                except Exception as e:
+                    print(f"⚠️ WebSocket/stream error: {e}")
+                    sys.stdout.flush()
+
+                # Reconnect logic (reached after inner loop breaks or outer exception)
+                print("🔄 Reconnecting in 5 seconds...")
+                sys.stdout.flush()
+                await asyncio.sleep(5)
+                
+                try:
+                    await self.client.close_connection()
+                except Exception:
+                    pass  # Old connection might already be dead
+                    
+                try:
+                    self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
+                    print("✅ Reconnected to Binance successfully!")
+                    sys.stdout.flush()
+                except Exception as reconnect_error:
+                    print(f"❌ Reconnection failed: {reconnect_error}")
+                    print("🔄 Retrying in 30 seconds...")
+                    sys.stdout.flush()
+                    await asyncio.sleep(30)
+                    continue
 
         except Exception as e:
             print(f"\n❌ FATAL ERROR in bot: {e}")
