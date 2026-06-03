@@ -42,6 +42,31 @@ class LiveORBSignals:
         self.sl_order_id = None
         self.tp_order_id = None
 
+    async def connect_with_retry(self, max_retries=5):
+        """Attempt to connect to Binance Testnet with exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                print(f"🔌 Connection attempt {attempt + 1}/{max_retries}...")
+                sys.stdout.flush()
+                client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
+                # Test the connection with a simple ping
+                await client.ping()
+                print("✅ Connected to Binance Testnet successfully!")
+                sys.stdout.flush()
+                return client
+            except Exception as e:
+                print(f"⚠️ Connection attempt {attempt + 1} failed: {e}")
+                sys.stdout.flush()
+                if attempt < max_retries - 1:
+                    wait_time = 10 * (attempt + 1)  # 10, 20, 30, 40, 50 seconds
+                    print(f"🔄 Retrying in {wait_time} seconds...")
+                    sys.stdout.flush()
+                    await asyncio.sleep(wait_time)
+                else:
+                    print("❌ Failed to connect after multiple attempts. Exiting.")
+                    sys.stdout.flush()
+                    raise  # Re-raise the exception to be caught in start()
+
     async def get_usdt_balance(self):
         try:
             acc = await self.client.futures_account_balance()
@@ -660,12 +685,8 @@ class LiveORBSignals:
             print(f"🔑 API Key: {masked_api}")
             sys.stdout.flush()
 
-            print("🔌 Connecting to Binance Futures Testnet...")
-            sys.stdout.flush()
-            
-            self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
-            print("✅ Connected to Binance Testnet successfully!")
-            sys.stdout.flush()
+            # CONNECTION WITH RETRIES
+            self.client = await self.connect_with_retry(max_retries=5)
 
             # Set leverage
             try:
@@ -788,12 +809,13 @@ class LiveORBSignals:
                 except Exception:
                     pass  # Old connection might already be dead
                     
+                # RECONNECT WITH RETRIES (using the same retry logic)
                 try:
-                    self.client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
+                    self.client = await self.connect_with_retry(max_retries=3)
                     print("✅ Reconnected to Binance successfully!")
                     sys.stdout.flush()
                 except Exception as reconnect_error:
-                    print(f"❌ Reconnection failed: {reconnect_error}")
+                    print(f"❌ Reconnection failed after retries: {reconnect_error}")
                     print("🔄 Retrying in 30 seconds...")
                     sys.stdout.flush()
                     await asyncio.sleep(30)
