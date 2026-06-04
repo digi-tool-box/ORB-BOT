@@ -139,8 +139,18 @@ class LiveORBSignals:
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
 
-        # Small delay to ensure position is registered on exchange
-        await asyncio.sleep(0.5)
+        # Cancel any existing open orders for this symbol to avoid -4130 error
+        try:
+            open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+            for order in open_orders:
+                await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
+                print(f"🗑️ Cancelled existing order {order['orderId']}")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ Error cancelling existing orders: {e}")
+
+        # Longer delay to ensure position is registered on exchange
+        await asyncio.sleep(1.5)
 
         for attempt in range(retries):
             try:
@@ -162,7 +172,7 @@ class LiveORBSignals:
                 print(f"❌ SL attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
 
         for attempt in range(retries):
             try:
@@ -183,7 +193,7 @@ class LiveORBSignals:
                 print(f"❌ TP attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
 
         return sl_success
 
@@ -721,28 +731,12 @@ class LiveORBSignals:
             sys.stdout.flush()
 
     async def recover_trade_count(self):
-        try:
-            print("🔍 Recovering trades taken today...")
-            sys.stdout.flush()
-
-            now_utc = datetime.now(pytz.utc)
-            today_start_utc = datetime(now_utc.year, now_utc.month, now_utc.day, 0, 0, 0, tzinfo=pytz.utc)
-            start_time_ms = int(today_start_utc.timestamp() * 1000)
-
-            all_orders = await self.client.futures_get_all_orders(symbol=SYMBOL, startTime=start_time_ms)
-
-            entry_trades = 0
-            for o in all_orders:
-                if o['status'] == 'FILLED' and o['type'] == 'MARKET':
-                    entry_trades += 1
-
-            self.trades_taken_today = entry_trades
-            print(f"📊 Recovered Trade Count: {self.trades_taken_today} entry trades today")
-            sys.stdout.flush()
-
-        except Exception as e:
-            print(f"⚠️ Error recovering trade count: {e}")
-            sys.stdout.flush()
+        # Trade count recovery is disabled to avoid overcounting emergency exits.
+        # The in-memory counter will be reset on each new day and increments correctly.
+        # Any open position is handled by recover_active_position().
+        print("🔍 Trade count recovery disabled – resetting to 0.")
+        sys.stdout.flush()
+        self.trades_taken_today = 0
 
     async def start(self):
         try:
