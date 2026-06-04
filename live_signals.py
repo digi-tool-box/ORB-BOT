@@ -143,7 +143,6 @@ class LiveORBSignals:
         await asyncio.sleep(0.5)
 
         for attempt in range(retries):
-            # Place Stop Loss
             try:
                 print(f"🛑 Placing SL {close_side} order at {stop_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
@@ -166,7 +165,6 @@ class LiveORBSignals:
                     await asyncio.sleep(1)
 
         for attempt in range(retries):
-            # Place Take Profit
             try:
                 print(f"🎯 Placing TP {close_side} order at {tp_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
@@ -299,25 +297,49 @@ class LiveORBSignals:
 
         try:
             pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+            position_exists = False
             for p in pos_info:
                 amt = float(p['positionAmt'])
                 if amt != 0:
+                    position_exists = True
                     unrealized_pnl = float(p['unRealizedProfit'])
                     if DEBUG_MODE:
                         print(f"📊 Position open: {amt} {SYMBOL}, Unrealized PnL: {unrealized_pnl:.2f} USDT")
                         sys.stdout.flush()
-                    return True
+                    break
 
-            print("📴 Position closed! (SL/TP hit)")
-            sys.stdout.flush()
-            self.active_position = None
+            if not position_exists:
+                print("📴 Position closed! (SL/TP hit)")
+                sys.stdout.flush()
+                self.active_position = None
+                if self.sl_order_id:
+                    await self.cancel_order(self.sl_order_id)
+                    self.sl_order_id = None
+                if self.tp_order_id:
+                    await self.cancel_order(self.tp_order_id)
+                    self.tp_order_id = None
+                return False
 
-            if self.sl_order_id:
-                await self.cancel_order(self.sl_order_id)
-                self.sl_order_id = None
-            if self.tp_order_id:
-                await self.cancel_order(self.tp_order_id)
-                self.tp_order_id = None
+            # SAFETY: If no SL order exists for this position, close immediately
+            if self.sl_order_id is None:
+                print("🚨 CRITICAL: Active position has no Stop Loss order! Forcing market close.")
+                sys.stdout.flush()
+                close_side = 'SELL' if self.active_position['side'] == 'BUY' else 'BUY'
+                try:
+                    await self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=abs(float(p['positionAmt']))
+                    )
+                    print("✅ Position closed via emergency market order.")
+                    self.active_position = None
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"❌ Failed to close position: {e}")
+                return False
+
+            return True
 
         except Exception as e:
             print(f"⚠️ Position check error: {e}")
@@ -355,6 +377,27 @@ class LiveORBSignals:
                 self.breakout_done = {'BUY': False, 'SELL': False}
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
+
+            # Force close any position at 4:00 PM NY (market close)
+            if self.active_position and ny_hour == 16 and ny_minute == 0:
+                print("🕟 End of NY session – closing any open position.")
+                sys.stdout.flush()
+                side = self.active_position['side']
+                close_side = 'SELL' if side == 'BUY' else 'BUY'
+                qty = abs((await self.client.futures_position_information(symbol=SYMBOL))[0]['positionAmt'])
+                try:
+                    await self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=float(qty)
+                    )
+                    print("✅ Position closed at end of session.")
+                    self.active_position = None
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"❌ Failed to close position at EOD: {e}")
+                return
 
             if self.active_position:
                 await self.update_trailing_stop(high_price, low_price, close_price)
@@ -465,7 +508,6 @@ class LiveORBSignals:
             risk = stop - entry_level
             target = entry_level - risk * RISK_REWARD
 
-        # Validate stop distance
         stop = self.validate_stop_distance(side, entry_level, stop)
 
         print(f"\n📋 Trade Details:")
@@ -497,7 +539,6 @@ class LiveORBSignals:
                 await self.cancel_order(self.tp_order_id)
                 self.tp_order_id = None
 
-            # Reset active position to avoid lingering state
             self.active_position = None
             return
 
@@ -616,6 +657,8 @@ class LiveORBSignals:
                 open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
                 sl_price = None
                 tp_price = None
+                sl_order_id = None
+                tp_order_id = None
 
                 for o in open_orders:
                     o_type = o['type']
@@ -624,21 +667,47 @@ class LiveORBSignals:
 
                     if o_side == expected_exit_side:
                         if o_type == 'STOP_MARKET':
-                            self.sl_order_id = o['orderId']
+                            sl_order_id = o['orderId']
                             sl_price = float(o['stopPrice'])
                         elif o_type == 'TAKE_PROFIT_MARKET':
-                            self.tp_order_id = o['orderId']
+                            tp_order_id = o['orderId']
                             tp_price = float(o['stopPrice'])
 
-                print(f"   🛑 Sync SL: OrderID={self.sl_order_id}, Price={sl_price if sl_price else 'N/A'}")
-                print(f"   🎯 Sync TP: OrderID={self.tp_order_id}, Price={tp_price if tp_price else 'N/A'}")
+                print(f"   🛑 Sync SL: OrderID={sl_order_id}, Price={sl_price if sl_price else 'N/A'}")
+                print(f"   🎯 Sync TP: OrderID={tp_order_id}, Price={tp_price if tp_price else 'N/A'}")
                 sys.stdout.flush()
 
+                # If missing SL or TP, close the position immediately
+                if sl_price is None or tp_price is None:
+                    print("🚨 Recovered position has incomplete SL/TP! Closing immediately to prevent loss.")
+                    sys.stdout.flush()
+                    close_side = 'SELL' if side == 'BUY' else 'BUY'
+                    try:
+                        await self.client.futures_create_order(
+                            symbol=SYMBOL,
+                            side=close_side,
+                            type='MARKET',
+                            quantity=abs(active_amt)
+                        )
+                        print("✅ Position closed successfully. No active position tracked.")
+                        sys.stdout.flush()
+                        self.active_position = None
+                        return
+                    except Exception as e:
+                        print(f"❌ Failed to close position: {e}")
+                        sys.stdout.flush()
+                        # Still do not track it – it's unsafe
+                        self.active_position = None
+                        return
+
+                # Only if both orders exist, restore active_position
+                self.sl_order_id = sl_order_id
+                self.tp_order_id = tp_order_id
                 self.active_position = {
                     'side': side,
                     'entry': entry_price,
-                    'sl': sl_price if sl_price else entry_price,
-                    'tp': tp_price if tp_price else entry_price,
+                    'sl': sl_price,
+                    'tp': tp_price,
                     'highest_high': entry_price,
                     'lowest_low': entry_price,
                     'breakeven_triggered': False
