@@ -135,33 +135,39 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
-    async def place_exit_orders(self, side, stop_price, tp_price, retries=3):
+    async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=3):
+        """
+        Place STOP_MARKET and TAKE_PROFIT_MARKET orders using explicit quantity.
+        This avoids the unreliable 'closePosition=True' on testnet.
+        """
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
 
-        # Cancel any existing open orders for this symbol to avoid -4130 error
+        # Cancel any existing open orders for this symbol to avoid conflicts
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for order in open_orders:
-                await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
-                print(f"🗑️ Cancelled existing order {order['orderId']}")
+                # Cancel any order on the same side (to avoid -4130)
+                if order['side'] == close_side:
+                    await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
+                    print(f"🗑️ Cancelled existing order {order['orderId']}")
             await asyncio.sleep(0.5)
         except Exception as e:
             print(f"⚠️ Error cancelling existing orders: {e}")
 
-        # Longer delay to ensure position is registered on exchange
+        # Wait for position to be fully registered
         await asyncio.sleep(1.5)
 
         for attempt in range(retries):
             try:
-                print(f"🛑 Placing SL {close_side} order at {stop_price:.2f} (attempt {attempt+1})...")
+                print(f"🛑 Placing SL {close_side} order for {quantity} units at {stop_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 sl = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
+                    quantity=quantity,
                     stopPrice=round(stop_price, PRICE_PRECISION),
-                    closePosition=True,
                 )
                 self.sl_order_id = sl['orderId']
                 print(f"✅ SL placed successfully! ID: {sl['orderId']}")
@@ -172,18 +178,18 @@ class LiveORBSignals:
                 print(f"❌ SL attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2)
 
         for attempt in range(retries):
             try:
-                print(f"🎯 Placing TP {close_side} order at {tp_price:.2f} (attempt {attempt+1})...")
+                print(f"🎯 Placing TP {close_side} order for {quantity} units at {tp_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 tp = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
+                    quantity=quantity,
                     stopPrice=round(tp_price, PRICE_PRECISION),
-                    closePosition=True,
                 )
                 self.tp_order_id = tp['orderId']
                 print(f"✅ TP placed successfully! ID: {tp['orderId']}")
@@ -193,7 +199,7 @@ class LiveORBSignals:
                 print(f"❌ TP attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2)
 
         return sl_success
 
@@ -277,8 +283,25 @@ class LiveORBSignals:
             print(f"🔄 Updating SL: {current_sl:.2f} → {new_sl:.2f}")
             sys.stdout.flush()
 
+            # Cancel old SL order
             if self.sl_order_id:
                 await self.cancel_order(self.sl_order_id)
+
+            # Get current position size to place new SL order with explicit quantity
+            try:
+                pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                current_qty = 0.0
+                for p in pos_info:
+                    amt = float(p['positionAmt'])
+                    if amt != 0:
+                        current_qty = abs(amt)
+                        break
+                if current_qty <= 0:
+                    print("⚠️ No position size found, cannot update trailing stop.")
+                    return
+            except Exception as e:
+                print(f"❌ Failed to get position size: {e}")
+                return
 
             close_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
@@ -286,8 +309,8 @@ class LiveORBSignals:
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
+                    quantity=current_qty,
                     stopPrice=round(new_sl, PRICE_PRECISION),
-                    closePosition=True,
                 )
                 self.sl_order_id = new_sl_order['orderId']
                 print(f"✅ New SL placed at {new_sl:.2f}")
@@ -308,10 +331,12 @@ class LiveORBSignals:
         try:
             pos_info = await self.client.futures_position_information(symbol=SYMBOL)
             position_exists = False
+            current_qty = 0.0
             for p in pos_info:
                 amt = float(p['positionAmt'])
                 if amt != 0:
                     position_exists = True
+                    current_qty = abs(amt)
                     unrealized_pnl = float(p['unRealizedProfit'])
                     if DEBUG_MODE:
                         print(f"📊 Position open: {amt} {SYMBOL}, Unrealized PnL: {unrealized_pnl:.2f} USDT")
@@ -331,7 +356,7 @@ class LiveORBSignals:
                 return False
 
             # SAFETY: If no SL order exists for this position, close immediately
-            if self.sl_order_id is None:
+            if self.sl_order_id is None and current_qty > 0:
                 print("🚨 CRITICAL: Active position has no Stop Loss order! Forcing market close.")
                 sys.stdout.flush()
                 close_side = 'SELL' if self.active_position['side'] == 'BUY' else 'BUY'
@@ -340,7 +365,7 @@ class LiveORBSignals:
                         symbol=SYMBOL,
                         side=close_side,
                         type='MARKET',
-                        quantity=abs(float(p['positionAmt']))
+                        quantity=current_qty
                     )
                     print("✅ Position closed via emergency market order.")
                     self.active_position = None
@@ -394,15 +419,22 @@ class LiveORBSignals:
                 sys.stdout.flush()
                 side = self.active_position['side']
                 close_side = 'SELL' if side == 'BUY' else 'BUY'
-                qty = abs((await self.client.futures_position_information(symbol=SYMBOL))[0]['positionAmt'])
                 try:
-                    await self.client.futures_create_order(
-                        symbol=SYMBOL,
-                        side=close_side,
-                        type='MARKET',
-                        quantity=float(qty)
-                    )
-                    print("✅ Position closed at end of session.")
+                    pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                    qty = 0.0
+                    for p in pos_info:
+                        amt = float(p['positionAmt'])
+                        if amt != 0:
+                            qty = abs(amt)
+                            break
+                    if qty > 0:
+                        await self.client.futures_create_order(
+                            symbol=SYMBOL,
+                            side=close_side,
+                            type='MARKET',
+                            quantity=qty
+                        )
+                        print("✅ Position closed at end of session.")
                     self.active_position = None
                     sys.stdout.flush()
                 except Exception as e:
@@ -527,7 +559,8 @@ class LiveORBSignals:
         print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
         sys.stdout.flush()
 
-        sl_placed = await self.place_exit_orders(side, stop, target)
+        # Pass the quantity to place_exit_orders
+        sl_placed = await self.place_exit_orders(side, stop, target, qty)
 
         if not sl_placed:
             print("🚨 CRITICAL: Stop Loss order failed to place! Initiating emergency market exit...")
@@ -706,7 +739,6 @@ class LiveORBSignals:
                     except Exception as e:
                         print(f"❌ Failed to close position: {e}")
                         sys.stdout.flush()
-                        # Still do not track it – it's unsafe
                         self.active_position = None
                         return
 
