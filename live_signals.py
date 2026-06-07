@@ -143,14 +143,18 @@ class LiveORBSignals:
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
 
-        # Cancel any existing open orders for this symbol to avoid conflicts
+        # Cancel any existing bot-placed SL/TP orders on the close side to avoid -4130.
+        # Only touches STOP_MARKET / TAKE_PROFIT_MARKET — leaves manual orders alone.
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for order in open_orders:
-                # Cancel any order on the same side (to avoid -4130)
-                if order['side'] == close_side:
-                    await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
-                    print(f"🗑️ Cancelled existing order {order['orderId']}")
+                if order['side'] == close_side and order['type'] in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
+                    try:
+                        await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
+                        print(f"🗑️ Cancelled existing {order['type']} order {order['orderId']}")
+                    except Exception as cancel_err:
+                        if "Unknown order sent" not in str(cancel_err):
+                            print(f"⚠️ Could not cancel order {order['orderId']}: {cancel_err}")
             await asyncio.sleep(0.5)
         except Exception as e:
             print(f"⚠️ Error cancelling existing orders: {e}")
@@ -413,8 +417,8 @@ class LiveORBSignals:
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
 
-            # Force close any position at 4:00 PM NY (market close)
-            if self.active_position and ny_hour == 16 and ny_minute == 0:
+            # Force close any position at or after 4:00 PM NY (market close)
+            if self.active_position and ny_hour >= 16:
                 print("🕟 End of NY session – closing any open position.")
                 sys.stdout.flush()
                 side = self.active_position['side']
@@ -797,6 +801,17 @@ class LiveORBSignals:
                 sys.stdout.flush()
             except Exception as e:
                 print(f"⚠️ Leverage setting warning: {e}")
+                sys.stdout.flush()
+
+            try:
+                await self.client.futures_change_margin_type(symbol=SYMBOL, marginType='ISOLATED')
+                print(f"✅ Margin mode set to ISOLATED")
+                sys.stdout.flush()
+            except Exception as e:
+                if "No need to change" in str(e):
+                    print(f"ℹ️ Margin mode already ISOLATED")
+                else:
+                    print(f"⚠️ Margin mode warning: {e}")
                 sys.stdout.flush()
 
             await self.recover_opening_range()
