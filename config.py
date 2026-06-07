@@ -10,7 +10,7 @@ SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 # === Trading pair & Leverage ===
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-LEVERAGE = 5                # <--- Yahan set kiya hai (Testing ke liye 5x safe aur best hai)
+LEVERAGE = 2                # 2x leverage keeps position size within $100 capital on BTC
 
 # === Backtest period (UTC) ===
 START_DATE = "2025-05-01"
