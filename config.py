@@ -13,15 +13,19 @@ INTERVAL = "5m"
 LEVERAGE = 2                # 2x leverage keeps position size within $100 capital on BTC
 
 # === Backtest period (UTC) ===
-START_DATE = "2025-05-01"
-END_DATE   = "2026-05-21"
+START_DATE = "2024-01-01"
+END_DATE   = "2025-01-01"
 
 # === Strategy parameters ===
 BREAKOUT_PCT = 0.5          # 0.5% candle range for valid breakout
-RETEST_ZONE_PCT = 0.1       # ±0.1% around OR level
+RETEST_ZONE_PCT = 0.25      # ±0.25% around OR level (wider for LIMIT fills)
 RISK_REWARD = 2.0           # 1:2
 SL_BUFFER_PCT = 0.0         # extra buffer below/above OR for SL
-SLIPPAGE_PCT = 0.05         # 0.05% slippage
+SLIPPAGE_PCT = 0.0          # no slippage — LIMIT order at OR level
+
+# === Binance Futures Fees ===
+MAKER_FEE = 0.02            # 0.02% maker fee (LIMIT entry)
+TAKER_FEE = 0.04            # 0.04% taker fee (SL/TP exit)
 
 # === NY session ===
 NY_TIMEZONE = "America/New_York"
@@ -43,7 +47,7 @@ TP1_PCT = 0.5               # 0.5% profit pe 50% position exit (1:1)
 TP2_PCT = 1.0               # 1.0% profit pe remaining position exit (1:2)
 
 # Risk Protection
-BREAKEVEN_TRIGGER = 0.002   # Profit 0.2% reach hote hi SL ko entry pe shift karo
+BREAKEVEN_TRIGGER = 0.005   # Profit 0.5% reach hote hi SL ko entry pe shift karo
 TRAIL_STEP_PCT = 0.001      # Trailing step 0.1%
 
 # === DEBUG & LOGGING ===
