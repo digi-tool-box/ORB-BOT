@@ -14,6 +14,7 @@ from config import (
     SYMBOL, INTERVAL, NY_TIMEZONE, NY_OPEN_HOUR, NY_OPEN_MINUTE,
     SLIPPAGE_PCT, RISK_PER_TRADE_PCT, INITIAL_CAPITAL, LEVERAGE,
     BREAKOUT_PCT, RETEST_ZONE_PCT, RISK_REWARD, SL_BUFFER_PCT,
+    BREAKEVEN_TRIGGER, MAKER_FEE, TAKER_FEE,
     MAX_TRADES_PER_DAY, DEBUG_MODE, QUANTITY_PRECISION, PRICE_PRECISION
 )
 
@@ -82,8 +83,7 @@ class LiveORBSignals:
 
     def calculate_quantity(self, entry, stop, side, balance):
         risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
-        effective_entry = entry * (1 + SLIPPAGE_PCT/100) if side == 'BUY' else entry * (1 - SLIPPAGE_PCT/100)
-        risk_per_unit = abs(effective_entry - stop)
+        risk_per_unit = abs(entry - stop)
         if risk_per_unit <= 0:
             print("⚠️ Risk per unit is zero, cannot calculate quantity")
             sys.stdout.flush()
@@ -117,23 +117,46 @@ class LiveORBSignals:
                 return new_stop
         return stop_price
 
-    async def place_market_order(self, side, quantity):
+    async def place_limit_order(self, side, quantity, price):
         try:
-            print(f"🚀 Placing {side} MARKET order for {quantity} {SYMBOL}...")
+            print(f"🚀 Placing {side} LIMIT order for {quantity} {SYMBOL} at {price:.2f}...")
             sys.stdout.flush()
             order = await self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
-                type='MARKET',
-                quantity=quantity
+                type='LIMIT',
+                price=round(price, PRICE_PRECISION),
+                quantity=quantity,
+                timeInForce='GTC'
             )
-            print(f"✅ {side} order placed successfully! OrderID: {order['orderId']}")
+            print(f"✅ {side} LIMIT order placed! OrderID: {order['orderId']}")
             sys.stdout.flush()
             return order
         except Exception as e:
-            print(f"❌ Entry order error: {e}")
+            print(f"❌ LIMIT order error: {e}")
             sys.stdout.flush()
             return None
+
+    async def wait_for_order_fill(self, order_id, timeout=120):
+        """Wait for LIMIT order to fill, checking every 2 seconds."""
+        for i in range(timeout // 2):
+            await asyncio.sleep(2)
+            try:
+                order = await self.client.futures_get_order(symbol=SYMBOL, orderId=order_id)
+                if order['status'] == 'FILLED':
+                    print(f"✅ LIMIT order {order_id} filled at {order['avgPrice']}")
+                    sys.stdout.flush()
+                    return order
+                elif order['status'] in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                    print(f"❌ LIMIT order {order_id} {order['status']}")
+                    sys.stdout.flush()
+                    return None
+            except Exception as e:
+                print(f"⚠️ Order status check error: {e}")
+                sys.stdout.flush()
+        print(f"⏰ LIMIT order {order_id} not filled after {timeout}s timeout")
+        sys.stdout.flush()
+        return None
 
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=3):
         """
@@ -227,71 +250,38 @@ class LiveORBSignals:
 
         pos = self.active_position
         side = pos['side']
-        highest_high = pos.get('highest_high', candle_high)
-        lowest_low = pos.get('lowest_low', candle_low)
         breakeven_triggered = pos.get('breakeven_triggered', False)
         current_sl = pos['sl']
 
-        breakeven_trigger_pct = 0.2 / 100
-        trailing_pct = 0.1 / 100
+        breakeven_trigger_pct = BREAKEVEN_TRIGGER
 
         new_sl = current_sl
         update_needed = False
 
         if side == 'BUY':
-            if candle_high > highest_high:
-                highest_high = candle_high
-                if DEBUG_MODE:
-                    print(f"📈 New High: {highest_high:.2f}")
-                    sys.stdout.flush()
-
-            profit_pct = (highest_high - pos['entry']) / pos['entry']
+            profit_pct = (candle_high - pos['entry']) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
                 print(f"🟢 Breakeven triggered! Moving SL to entry: {new_sl:.2f}")
                 sys.stdout.flush()
-
-            if breakeven_triggered:
-                trail_sl = highest_high * (1 - trailing_pct)
-                if trail_sl > new_sl:
-                    new_sl = trail_sl
-                    update_needed = True
-                    print(f"📈 Trailing SL Up: {new_sl:.2f}")
-                    sys.stdout.flush()
         else:
-            if candle_low < lowest_low:
-                lowest_low = candle_low
-                if DEBUG_MODE:
-                    print(f"📉 New Low: {lowest_low:.2f}")
-                    sys.stdout.flush()
-
-            profit_pct = (pos['entry'] - lowest_low) / pos['entry']
+            profit_pct = (pos['entry'] - candle_low) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
                 print(f"🟢 Breakeven triggered! Moving SL to entry: {new_sl:.2f}")
                 sys.stdout.flush()
-
-            if breakeven_triggered:
-                trail_sl = lowest_low * (1 + trailing_pct)
-                if trail_sl < new_sl:
-                    new_sl = trail_sl
-                    update_needed = True
-                    print(f"📉 Trailing SL Down: {new_sl:.2f}")
-                    sys.stdout.flush()
 
         if update_needed:
             print(f"🔄 Updating SL: {current_sl:.2f} → {new_sl:.2f}")
             sys.stdout.flush()
 
-            # Cancel old SL order
             if self.sl_order_id:
                 await self.cancel_order(self.sl_order_id)
 
-            # Get current position size to place new SL order with explicit quantity
             try:
                 pos_info = await self.client.futures_position_information(symbol=SYMBOL)
                 current_qty = 0.0
@@ -301,7 +291,7 @@ class LiveORBSignals:
                         current_qty = abs(amt)
                         break
                 if current_qty <= 0:
-                    print("⚠️ No position size found, cannot update trailing stop.")
+                    print("⚠️ No position size found, cannot update breakeven SL.")
                     return
             except Exception as e:
                 print(f"❌ Failed to get position size: {e}")
@@ -317,14 +307,12 @@ class LiveORBSignals:
                     stopPrice=round(new_sl, PRICE_PRECISION),
                 )
                 self.sl_order_id = new_sl_order['orderId']
-                print(f"✅ New SL placed at {new_sl:.2f}")
+                print(f"✅ New SL at entry: {new_sl:.2f}")
                 sys.stdout.flush()
             except Exception as e:
-                print(f"❌ Trailing SL order error: {e}")
+                print(f"❌ Breakeven SL order error: {e}")
                 sys.stdout.flush()
 
-        self.active_position['highest_high'] = highest_high
-        self.active_position['lowest_low'] = lowest_low
         self.active_position['breakeven_triggered'] = breakeven_triggered
         self.active_position['sl'] = new_sl
 
@@ -539,35 +527,51 @@ class LiveORBSignals:
             sys.stdout.flush()
             return
 
-        order = await self.place_market_order(side, qty)
+        # Place LIMIT order at OR level
+        order = await self.place_limit_order(side, qty, entry_level)
         if not order:
-            print("❌ Entry order failed, trade aborted")
+            print("❌ LIMIT entry order failed, trade aborted")
             sys.stdout.flush()
             return
 
+        order_id = order['orderId']
+
+        # Wait for LIMIT order to fill (max 120 seconds)
+        filled_order = await self.wait_for_order_fill(order_id)
+        if not filled_order:
+            print(f"⚠️ LIMIT order {order_id} not filled. Cancelling.")
+            sys.stdout.flush()
+            await self.cancel_order(order_id)
+            return
+
+        # Use actual fill price for all calculations
+        fill_price = float(filled_order['avgPrice'])
+        print(f"💵 Actual fill price: {fill_price:.2f}")
+        sys.stdout.flush()
+
+        # Recalculate SL/TP based on actual fill price
         if side == 'BUY':
             stop = stop_level * (1 - SL_BUFFER_PCT/100)
-            risk = entry_level - stop
-            target = entry_level + risk * RISK_REWARD
+            risk = fill_price - stop
+            target = fill_price + risk * RISK_REWARD
         else:
             stop = stop_level * (1 + SL_BUFFER_PCT/100)
-            risk = stop - entry_level
-            target = entry_level - risk * RISK_REWARD
+            risk = stop - fill_price
+            target = fill_price - risk * RISK_REWARD
 
-        stop = self.validate_stop_distance(side, entry_level, stop)
+        stop = self.validate_stop_distance(side, fill_price, stop)
 
         print(f"\n📋 Trade Details:")
         print(f"   Side: {side}")
-        print(f"   Entry: {entry_level:.2f}")
+        print(f"   Entry (filled): {fill_price:.2f}")
         print(f"   Stop Loss: {stop:.2f} (Risk: {risk:.2f})")
         print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
         sys.stdout.flush()
 
-        # Pass the quantity to place_exit_orders
         sl_placed = await self.place_exit_orders(side, stop, target, qty)
 
         if not sl_placed:
-            print("🚨 CRITICAL: Stop Loss order failed to place! Initiating emergency market exit...")
+            print("🚨 CRITICAL: Stop Loss order failed! Emergency market exit...")
             sys.stdout.flush()
             exit_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
@@ -577,9 +581,9 @@ class LiveORBSignals:
                     type='MARKET',
                     quantity=qty
                 )
-                print("🚨 Emergency market exit order placed successfully!")
+                print("🚨 Emergency market exit order placed!")
             except Exception as e:
-                print(f"🚨 CRITICAL ERROR: Emergency exit failed! Manual intervention required! Error: {e}")
+                print(f"🚨 CRITICAL: Emergency exit failed! Error: {e}")
             sys.stdout.flush()
 
             if self.tp_order_id:
@@ -591,15 +595,13 @@ class LiveORBSignals:
 
         self.active_position = {
             'side': side,
-            'entry': entry_level,
+            'entry': fill_price,
             'sl': stop,
             'tp': target,
-            'highest_high': entry_level,
-            'lowest_low': entry_level,
             'breakeven_triggered': False
         }
 
-        print(f"\n✅ {side} POSITION ACTIVE - Monitoring...")
+        print(f"\n✅ {side} POSITION ACTIVE @ {fill_price:.2f} - Monitoring...")
         print(f"{'='*50}\n")
         sys.stdout.flush()
 
