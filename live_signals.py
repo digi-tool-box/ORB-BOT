@@ -82,14 +82,15 @@ class LiveORBSignals:
         return INITIAL_CAPITAL
 
     def calculate_quantity(self, entry, stop, side, balance):
-        risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
+        effective_balance = min(balance, INITIAL_CAPITAL)
+        risk_amount = effective_balance * (RISK_PER_TRADE_PCT / 100)
         risk_per_unit = abs(entry - stop)
         if risk_per_unit <= 0:
             print("⚠️ Risk per unit is zero, cannot calculate quantity")
             sys.stdout.flush()
             return 0
         qty = risk_amount / risk_per_unit
-        print(f"📊 Qty Calc: Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
+        print(f"📊 Qty Calc: EffectiveBal={effective_balance:.2f}, Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
         return round(qty, QUANTITY_PRECISION)
 
@@ -814,6 +815,17 @@ class LiveORBSignals:
                     print(f"ℹ️ Margin mode already ISOLATED")
                 else:
                     print(f"⚠️ Margin mode warning: {e}")
+                sys.stdout.flush()
+
+            try:
+                await self.client.futures_change_position_mode(dualSidePosition=False)
+                print(f"✅ Position mode set to ONE-WAY")
+                sys.stdout.flush()
+            except Exception as e:
+                if "No need to change" in str(e):
+                    print(f"ℹ️ Position mode already ONE-WAY")
+                else:
+                    print(f"⚠️ Position mode warning: {e}")
                 sys.stdout.flush()
 
             await self.recover_opening_range()
