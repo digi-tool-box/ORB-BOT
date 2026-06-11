@@ -138,9 +138,20 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
-    async def wait_for_order_fill(self, order_id, timeout=120):
-        """Wait for LIMIT order to fill, checking every 2 seconds."""
+    async def wait_for_order_fill(self, order_id, timeout=120, stream=None):
         for i in range(timeout // 2):
+            # Drain all pending WebSocket messages to prevent queue overflow
+            if stream:
+                drained = 0
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(stream.recv(), timeout=0.01)
+                        drained += 1
+                    except (asyncio.TimeoutError, Exception):
+                        break
+                if drained > 50:
+                    print(f"🧹 Drained {drained} WebSocket msgs while waiting for fill")
+                    sys.stdout.flush()
             await asyncio.sleep(2)
             try:
                 order = await self.client.futures_get_order(symbol=SYMBOL, orderId=order_id)
@@ -160,15 +171,11 @@ class LiveORBSignals:
         return None
 
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=3):
-        """
-        Place STOP_MARKET and TAKE_PROFIT_MARKET orders using explicit quantity.
-        This avoids the unreliable 'closePosition=True' on testnet.
-        """
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
+        tp_success = False
 
         # Cancel any existing bot-placed SL/TP orders on the close side to avoid -4130.
-        # Only touches STOP_MARKET / TAKE_PROFIT_MARKET — leaves manual orders alone.
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for order in open_orders:
@@ -183,18 +190,18 @@ class LiveORBSignals:
         except Exception as e:
             print(f"⚠️ Error cancelling existing orders: {e}")
 
-        # Wait for position to be fully registered
         await asyncio.sleep(1.5)
 
+        # Place SL with closePosition=True (avoid quantity-related testnet bugs)
         for attempt in range(retries):
             try:
-                print(f"🛑 Placing SL {close_side} order for {quantity} units at {stop_price:.2f} (attempt {attempt+1})...")
+                print(f"🛑 Placing SL {close_side} STOP_MARKET (closePosition) at {stop_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 sl = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    quantity=quantity,
+                    closePosition=True,
                     stopPrice=round(stop_price, PRICE_PRECISION),
                 )
                 self.sl_order_id = sl['orderId']
@@ -208,20 +215,56 @@ class LiveORBSignals:
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
 
+        # Check current mark price before placing TP
+        try:
+            ticker = await self.client.futures_symbol_ticker(symbol=SYMBOL)
+            mark_price = float(ticker['price'])
+            print(f"📊 Current mark price for TP check: {mark_price:.2f}")
+            sys.stdout.flush()
+
+            tp_would_trigger = False
+            if side == 'BUY' and mark_price >= tp_price:
+                tp_would_trigger = True
+            elif side == 'SELL' and mark_price <= tp_price:
+                tp_would_trigger = True
+
+            if tp_would_trigger:
+                print(f"⚠️ TP {tp_price:.2f} would trigger immediately (mark {mark_price:.2f}). Using MARKET order instead.")
+                sys.stdout.flush()
+                try:
+                    await self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=quantity,
+                    )
+                    print(f"✅ TP executed via MARKET order at {mark_price:.2f}")
+                    sys.stdout.flush()
+                    tp_success = True
+                    return sl_success, tp_success
+                except Exception as e:
+                    print(f"❌ MARKET TP exit failed: {e}")
+                    sys.stdout.flush()
+        except Exception as e:
+            print(f"⚠️ Could not fetch mark price: {e}")
+            sys.stdout.flush()
+
+        # Place TP with closePosition=True
         for attempt in range(retries):
             try:
-                print(f"🎯 Placing TP {close_side} order for {quantity} units at {tp_price:.2f} (attempt {attempt+1})...")
+                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET (closePosition) at {tp_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 tp = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
-                    quantity=quantity,
+                    closePosition=True,
                     stopPrice=round(tp_price, PRICE_PRECISION),
                 )
                 self.tp_order_id = tp['orderId']
                 print(f"✅ TP placed successfully! ID: {tp['orderId']}")
                 sys.stdout.flush()
+                tp_success = True
                 break
             except Exception as e:
                 print(f"❌ TP attempt {attempt+1} failed: {e}")
@@ -229,7 +272,7 @@ class LiveORBSignals:
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
 
-        return sl_success
+        return sl_success, tp_success
 
     async def cancel_order(self, order_id):
         if not order_id:
@@ -375,7 +418,7 @@ class LiveORBSignals:
 
         return False
 
-    async def process_closed_candle(self, kline):
+    async def process_closed_candle(self, kline, stream=None):
         try:
             candle_open_ts = kline['t']
             utc_time = datetime.fromtimestamp(candle_open_ts / 1000, tz=pytz.utc)
@@ -494,7 +537,7 @@ class LiveORBSignals:
                     print(f"{'!'*50}")
                     sys.stdout.flush()
 
-                    await self.execute_trade('BUY', self.or_high, self.or_low)
+                    await self.execute_trade('BUY', self.or_high, self.or_low, stream=stream)
                     self.breakout_done['BUY'] = True
                     self.trades_taken_today += 1
                     return
@@ -510,7 +553,7 @@ class LiveORBSignals:
                     print(f"{'!'*50}")
                     sys.stdout.flush()
 
-                    await self.execute_trade('SELL', self.or_low, self.or_high)
+                    await self.execute_trade('SELL', self.or_low, self.or_high, stream=stream)
                     self.breakout_done['SELL'] = True
                     self.trades_taken_today += 1
                     return
@@ -519,7 +562,7 @@ class LiveORBSignals:
             print(f"❌ Error processing candle: {e}")
             sys.stdout.flush()
 
-    async def execute_trade(self, side, entry_level, stop_level):
+    async def execute_trade(self, side, entry_level, stop_level, stream=None):
         balance = await self.get_usdt_balance()
         qty = self.calculate_quantity(entry_level, stop_level, side, balance)
 
@@ -528,7 +571,6 @@ class LiveORBSignals:
             sys.stdout.flush()
             return
 
-        # Place LIMIT order at OR level
         order = await self.place_limit_order(side, qty, entry_level)
         if not order:
             print("❌ LIMIT entry order failed, trade aborted")
@@ -537,20 +579,17 @@ class LiveORBSignals:
 
         order_id = order['orderId']
 
-        # Wait for LIMIT order to fill (max 120 seconds)
-        filled_order = await self.wait_for_order_fill(order_id)
+        filled_order = await self.wait_for_order_fill(order_id, stream=stream)
         if not filled_order:
             print(f"⚠️ LIMIT order {order_id} not filled. Cancelling.")
             sys.stdout.flush()
             await self.cancel_order(order_id)
             return
 
-        # Use actual fill price for all calculations
         fill_price = float(filled_order['avgPrice'])
         print(f"💵 Actual fill price: {fill_price:.2f}")
         sys.stdout.flush()
 
-        # Recalculate SL/TP based on actual fill price
         if side == 'BUY':
             stop = stop_level * (1 - SL_BUFFER_PCT/100)
             risk = fill_price - stop
@@ -569,10 +608,10 @@ class LiveORBSignals:
         print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
         sys.stdout.flush()
 
-        sl_placed = await self.place_exit_orders(side, stop, target, qty)
+        sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
 
-        if not sl_placed:
-            print("🚨 CRITICAL: Stop Loss order failed! Emergency market exit...")
+        if not sl_placed and not tp_placed:
+            print("🚨 CRITICAL: Both SL and TP failed! Emergency market exit...")
             sys.stdout.flush()
             exit_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
@@ -896,7 +935,7 @@ class LiveORBSignals:
 
                                     if kline['x']:
                                         candles_processed += 1
-                                        await self.process_closed_candle(kline)
+                                        await self.process_closed_candle(kline, stream=s)
                                 elif msg:
                                     print(f"⚠️ Non-kline message: {str(msg)[:200]}")
                                     sys.stdout.flush()
