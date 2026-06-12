@@ -118,56 +118,51 @@ class LiveORBSignals:
                 return new_stop
         return stop_price
 
-    async def place_limit_order(self, side, quantity, price):
+    async def place_stop_entry_order(self, side, quantity, stop_price):
         try:
-            print(f"🚀 Placing {side} LIMIT order for {quantity} {SYMBOL} at {price:.2f}...")
+            print(f"🚀 Placing {side} STOP_MARKET entry for {quantity} {SYMBOL} at {stop_price:.2f}...")
             sys.stdout.flush()
             order = await self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
-                type='LIMIT',
-                price=round(price, PRICE_PRECISION),
+                type='STOP_MARKET',
+                stopPrice=round(stop_price, PRICE_PRECISION),
                 quantity=quantity,
-                timeInForce='GTC'
             )
-            print(f"✅ {side} LIMIT order placed! OrderID: {order['orderId']}")
+            print(f"✅ {side} STOP_MARKET entry placed! OrderID: {order['orderId']}")
             sys.stdout.flush()
             return order
         except Exception as e:
-            print(f"❌ LIMIT order error: {e}")
+            print(f"❌ STOP_MARKET entry error: {e}")
             sys.stdout.flush()
             return None
 
-    async def wait_for_order_fill(self, order_id, timeout=120, stream=None):
+    async def wait_for_stop_fill(self, order_id, timeout=300):
         for i in range(timeout // 2):
-            # Drain all pending WebSocket messages to prevent queue overflow
-            if stream:
-                drained = 0
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(stream.recv(), timeout=0.01)
-                        drained += 1
-                    except (asyncio.TimeoutError, Exception):
-                        break
-                if drained > 50:
-                    print(f"🧹 Drained {drained} WebSocket msgs while waiting for fill")
-                    sys.stdout.flush()
             await asyncio.sleep(2)
             try:
                 order = await self.client.futures_get_order(symbol=SYMBOL, orderId=order_id)
-                if order['status'] == 'FILLED':
-                    print(f"✅ LIMIT order {order_id} filled at {order['avgPrice']}")
+                status = order['status']
+                if status == 'FILLED':
+                    print(f"✅ STOP entry {order_id} filled! AvgPrice: {order['avgPrice']}")
                     sys.stdout.flush()
                     return order
-                elif order['status'] in ('CANCELED', 'EXPIRED', 'REJECTED'):
-                    print(f"❌ LIMIT order {order_id} {order['status']}")
+                elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                    print(f"❌ STOP entry {order_id} {status}")
                     sys.stdout.flush()
                     return None
+                elif status == 'NEW':
+                    print(f"⏳ STOP entry {order_id} waiting for trigger (status: {status})...")
+                    sys.stdout.flush()
             except Exception as e:
-                print(f"⚠️ Order status check error: {e}")
+                print(f"⚠️ Stop order status check error: {e}")
                 sys.stdout.flush()
-        print(f"⏰ LIMIT order {order_id} not filled after {timeout}s timeout")
+        print(f"⏰ STOP entry {order_id} not triggered after {timeout}s timeout")
         sys.stdout.flush()
+        try:
+            await self.cancel_order(order_id)
+        except:
+            pass
         return None
 
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=3):
@@ -590,7 +585,7 @@ class LiveORBSignals:
                     print(f"{'!'*50}")
                     sys.stdout.flush()
 
-                    await self.execute_trade('BUY', self.or_high, self.or_low, stream=stream)
+                    await self.execute_trade('BUY', self.or_high, self.or_low)
                     self.breakout_done['BUY'] = True
                     self.trades_taken_today += 1
                     return
@@ -606,7 +601,7 @@ class LiveORBSignals:
                     print(f"{'!'*50}")
                     sys.stdout.flush()
 
-                    await self.execute_trade('SELL', self.or_low, self.or_high, stream=stream)
+                    await self.execute_trade('SELL', self.or_low, self.or_high)
                     self.breakout_done['SELL'] = True
                     self.trades_taken_today += 1
                     return
@@ -615,7 +610,7 @@ class LiveORBSignals:
             print(f"❌ Error processing candle: {e}")
             sys.stdout.flush()
 
-    async def execute_trade(self, side, entry_level, stop_level, stream=None):
+    async def execute_trade(self, side, entry_level, stop_level):
         balance = await self.get_usdt_balance()
         qty = self.calculate_quantity(entry_level, stop_level, side, balance)
 
@@ -624,19 +619,18 @@ class LiveORBSignals:
             sys.stdout.flush()
             return
 
-        order = await self.place_limit_order(side, qty, entry_level)
+        order = await self.place_stop_entry_order(side, qty, entry_level)
         if not order:
-            print("❌ LIMIT entry order failed, trade aborted")
+            print("❌ STOP entry order failed, trade aborted")
             sys.stdout.flush()
             return
 
         order_id = order['orderId']
 
-        filled_order = await self.wait_for_order_fill(order_id, stream=stream)
+        filled_order = await self.wait_for_stop_fill(order_id)
         if not filled_order:
-            print(f"⚠️ LIMIT order {order_id} not filled. Cancelling.")
+            print(f"⚠️ STOP entry {order_id} not triggered. Order cancelled.")
             sys.stdout.flush()
-            await self.cancel_order(order_id)
             return
 
         fill_price = float(filled_order['avgPrice'])
