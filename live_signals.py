@@ -129,9 +129,20 @@ class LiveORBSignals:
                 stopPrice=round(stop_price, PRICE_PRECISION),
                 quantity=quantity,
             )
-            print(f"✅ {side} STOP_MARKET entry placed! OrderID: {order['orderId']}")
+            order_id = order.get('orderId')
+            if order_id:
+                print(f"✅ {side} STOP_MARKET entry placed! OrderID: {order_id}")
+                sys.stdout.flush()
+                return order
+            fallback = await self.client.futures_get_open_orders(symbol=SYMBOL)
+            for o in fallback:
+                if o['side'] == side and o['type'] == 'STOP_MARKET':
+                    print(f"✅ Entry order recovered from open orders! ID: {o['orderId']}")
+                    sys.stdout.flush()
+                    return o
+            print("⚠️ Entry order placed but missing orderId in response")
             sys.stdout.flush()
-            return order
+            return None
         except Exception as e:
             print(f"❌ STOP_MARKET entry error: {e}")
             sys.stdout.flush()
@@ -497,32 +508,33 @@ class LiveORBSignals:
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
 
-            # Force close any position at or after 4:00 PM NY (market close)
-            if self.active_position and ny_hour >= 16:
-                print("🕟 End of NY session – closing any open position.")
-                sys.stdout.flush()
-                side = self.active_position['side']
-                close_side = 'SELL' if side == 'BUY' else 'BUY'
-                try:
-                    pos_info = await self.client.futures_position_information(symbol=SYMBOL)
-                    qty = 0.0
-                    for p in pos_info:
-                        amt = float(p['positionAmt'])
-                        if amt != 0:
-                            qty = abs(amt)
-                            break
-                    if qty > 0:
-                        await self.client.futures_create_order(
-                            symbol=SYMBOL,
-                            side=close_side,
-                            type='MARKET',
-                            quantity=qty
-                        )
-                        print("✅ Position closed at end of session.")
-                    self.active_position = None
+            # No trading after 4:00 PM NY (market close)
+            if ny_hour >= 16:
+                if self.active_position:
+                    print("🕟 End of NY session – closing any open position.")
                     sys.stdout.flush()
-                except Exception as e:
-                    print(f"❌ Failed to close position at EOD: {e}")
+                    side = self.active_position['side']
+                    close_side = 'SELL' if side == 'BUY' else 'BUY'
+                    try:
+                        pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                        qty = 0.0
+                        for p in pos_info:
+                            amt = float(p['positionAmt'])
+                            if amt != 0:
+                                qty = abs(amt)
+                                break
+                        if qty > 0:
+                            await self.client.futures_create_order(
+                                symbol=SYMBOL,
+                                side=close_side,
+                                type='MARKET',
+                                quantity=qty
+                            )
+                            print("✅ Position closed at end of session.")
+                        self.active_position = None
+                        sys.stdout.flush()
+                    except Exception as e:
+                        print(f"❌ Failed to close position at EOD: {e}")
                 return
 
             if self.active_position:
