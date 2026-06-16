@@ -42,6 +42,11 @@ class LiveORBSignals:
         self.active_position = None
         self.sl_order_id = None
         self.tp_order_id = None
+        self.pending_order_id = None
+        self.pending_order_side = None
+        self.pending_entry_level = None
+        self.pending_stop_level = None
+        self.pending_qty = None
 
     async def connect_with_retry(self, max_retries=5):
         """Attempt to connect to Binance Testnet with exponential backoff."""
@@ -118,6 +123,42 @@ class LiveORBSignals:
                 return new_stop
         return stop_price
 
+    async def place_limit_entry_order(self, side, price):
+        try:
+            balance = await self.get_usdt_balance()
+            stop_level = self.pending_stop_level
+            qty = self.calculate_quantity(price, stop_level, side, balance)
+            if qty <= 0:
+                print("⚠️ Invalid quantity, cannot place LIMIT order")
+                sys.stdout.flush()
+                return None
+            self.pending_qty = qty
+            print(f"🚀 Placing {side} LIMIT entry for {qty} {SYMBOL} at {price:.2f} (GTC)...")
+            sys.stdout.flush()
+            order = await self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=side,
+                type='LIMIT',
+                price=round(price, PRICE_PRECISION),
+                quantity=qty,
+                timeInForce='GTC'
+            )
+            order_id = order.get('orderId')
+            if order_id:
+                self.pending_order_id = order_id
+                self.pending_order_side = side
+                self.pending_entry_level = price
+                print(f"✅ {side} LIMIT entry placed! OrderID: {order_id}")
+                sys.stdout.flush()
+                return order
+            print("⚠️ LIMIT order placed but missing orderId in response")
+            sys.stdout.flush()
+            return None
+        except Exception as e:
+            print(f"❌ LIMIT entry error: {e}")
+            sys.stdout.flush()
+            return None
+
     async def place_stop_entry_order(self, side, quantity, stop_price):
         try:
             print(f"🚀 Placing {side} STOP_MARKET entry for {quantity} {SYMBOL} at {stop_price:.2f}...")
@@ -145,6 +186,29 @@ class LiveORBSignals:
             return None
         except Exception as e:
             print(f"❌ STOP_MARKET entry error: {e}")
+            sys.stdout.flush()
+            return None
+
+    async def place_market_entry_order(self, side, quantity):
+        try:
+            print(f"🚀 Placing {side} MARKET entry for {quantity} {SYMBOL}...")
+            sys.stdout.flush()
+            order = await self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=side,
+                type='MARKET',
+                quantity=quantity,
+            )
+            order_id = order.get('orderId')
+            if order_id:
+                print(f"✅ {side} MARKET entry filled! OrderID: {order_id}, Price: {order.get('avgPrice', 'N/A')}")
+                sys.stdout.flush()
+                return order
+            print("⚠️ MARKET order placed but missing orderId in response")
+            sys.stdout.flush()
+            return None
+        except Exception as e:
+            print(f"❌ MARKET entry error: {e}")
             sys.stdout.flush()
             return None
 
@@ -347,6 +411,72 @@ class LiveORBSignals:
                 print(f"⚠️ Cancel order error (may be filled): {e}")
                 sys.stdout.flush()
 
+    async def check_pending_limit_fill(self):
+        if not self.pending_order_id:
+            return False
+        try:
+            order = await self.client.futures_get_order(symbol=SYMBOL, orderId=self.pending_order_id)
+            status = order['status']
+            if status == 'FILLED':
+                fill_price = float(order['avgPrice'])
+                print(f"\n{'='*50}")
+                print(f"✅ LIMIT order {self.pending_order_id} FILLED @ {fill_price:.2f}!")
+                sys.stdout.flush()
+                side = self.pending_order_side
+                stop_level = self.pending_stop_level
+                qty = self.pending_qty
+                if side == 'BUY':
+                    stop = stop_level * (1 - SL_BUFFER_PCT/100)
+                    risk = fill_price - stop
+                    target = fill_price + risk * RISK_REWARD
+                else:
+                    stop = stop_level * (1 + SL_BUFFER_PCT/100)
+                    risk = stop - fill_price
+                    target = fill_price - risk * RISK_REWARD
+                stop = self.validate_stop_distance(side, fill_price, stop)
+                print(f"📋 Trade Details:")
+                print(f"   Side: {side}")
+                print(f"   Entry (filled): {fill_price:.2f}")
+                print(f"   Stop Loss: {stop:.2f} (Risk: {risk:.2f})")
+                print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
+                sys.stdout.flush()
+                sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
+                if not sl_placed and not tp_placed:
+                    print("🚨 CRITICAL: Both SL and TP failed! Emergency market exit...")
+                    sys.stdout.flush()
+                    close_side = 'SELL' if side == 'BUY' else 'BUY'
+                    try:
+                        await self.client.futures_create_order(
+                            symbol=SYMBOL, side=close_side, type='MARKET', quantity=qty
+                        )
+                    except Exception as e:
+                        print(f"🚨 Emergency exit failed: {e}")
+                    self.pending_order_id = None
+                    return False
+                self.active_position = {
+                    'side': side,
+                    'entry': fill_price,
+                    'sl': stop,
+                    'tp': target,
+                    'breakeven_triggered': False
+                }
+                order_id = self.pending_order_id
+                self.pending_order_id = None
+                self.trades_taken_today += 1
+                print(f"\n✅ {side} POSITION ACTIVE @ {fill_price:.2f} - Monitoring...")
+                print(f"{'='*50}\n")
+                sys.stdout.flush()
+                return True
+            elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                print(f"❌ Pending LIMIT order {self.pending_order_id} {status}")
+                self.pending_order_id = None
+                return False
+            return False
+        except Exception as e:
+            print(f"⚠️ Error checking pending limit fill: {e}")
+            sys.stdout.flush()
+            return False
+
     async def update_trailing_stop(self, candle_high, candle_low, candle_close):
         if not self.active_position:
             return
@@ -507,9 +637,17 @@ class LiveORBSignals:
                 self.breakout_done = {'BUY': False, 'SELL': False}
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
+                if self.pending_order_id:
+                    await self.cancel_order(self.pending_order_id)
+                    self.pending_order_id = None
 
             # No trading after 4:00 PM NY (market close)
             if ny_hour >= 16:
+                if self.pending_order_id:
+                    await self.cancel_order(self.pending_order_id)
+                    self.pending_order_id = None
+                    print("🗑️ Pending LIMIT order cancelled at EOD")
+                    sys.stdout.flush()
                 if self.active_position:
                     print("🕟 End of NY session – closing any open position.")
                     sys.stdout.flush()
@@ -556,6 +694,12 @@ class LiveORBSignals:
                     sys.stdout.flush()
                 return
 
+            # Check if pending LIMIT order got filled (retest confirmation)
+            if self.pending_order_id:
+                filled = await self.check_pending_limit_fill()
+                if filled:
+                    return
+
             self.candles_today.append({
                 'timestamp': candle_open_ts,
                 'ny_time': ny_time,
@@ -574,48 +718,28 @@ class LiveORBSignals:
             low = last['low']
             candle_range_pct = ((high - low) / low) * 100
 
-            if close > self.or_high and not self.breakout_detected['BUY'] and not self.breakout_done['BUY']:
+            # BUY BREAKOUT → place LIMIT order at OR High (will fill on retest)
+            if close > self.or_high and not self.breakout_done['BUY'] and not self.pending_order_id:
                 if candle_range_pct >= BREAKOUT_PCT:
-                    self.breakout_detected['BUY'] = True
-                    print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Waiting for retest...")
-                    sys.stdout.flush()
-
-            if close < self.or_low and not self.breakout_detected['SELL'] and not self.breakout_done['SELL']:
-                if candle_range_pct >= BREAKOUT_PCT:
-                    self.breakout_detected['SELL'] = True
-                    print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Waiting for retest...")
-                    sys.stdout.flush()
-
-            if self.breakout_detected['BUY'] and not self.breakout_done['BUY']:
-                retest_upper = self.or_high * (1 + RETEST_ZONE_PCT/100)
-                retest_lower = self.or_high * (1 - RETEST_ZONE_PCT/100)
-                if low <= retest_upper and high >= retest_lower:
-                    print(f"\n{'!'*50}")
-                    print(f"🚀 BUY RETEST SIGNAL DETECTED!")
-                    print(f"   Low: {low:.2f} <= Retest Upper: {retest_upper:.2f}")
-                    print(f"   High: {high:.2f} >= Retest Lower: {retest_lower:.2f}")
-                    print(f"{'!'*50}")
-                    sys.stdout.flush()
-
-                    await self.execute_trade('BUY', self.or_high, self.or_low)
                     self.breakout_done['BUY'] = True
-                    self.trades_taken_today += 1
+                    print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Placing LIMIT BUY at OR High...")
+                    sys.stdout.flush()
+                    self.pending_stop_level = self.or_low
+                    await self.place_limit_entry_order('BUY', self.or_high)
+                    if self.pending_order_id:
+                        print(f"⏳ LIMIT BUY at {self.or_high:.2f} online — will fill when price retests OR High")
                     return
 
-            if self.breakout_detected['SELL'] and not self.breakout_done['SELL']:
-                retest_upper = self.or_low * (1 + RETEST_ZONE_PCT/100)
-                retest_lower = self.or_low * (1 - RETEST_ZONE_PCT/100)
-                if high >= retest_lower and low <= retest_upper:
-                    print(f"\n{'!'*50}")
-                    print(f"🔻 SELL RETEST SIGNAL DETECTED!")
-                    print(f"   High: {high:.2f} >= Retest Lower: {retest_lower:.2f}")
-                    print(f"   Low: {low:.2f} <= Retest Upper: {retest_upper:.2f}")
-                    print(f"{'!'*50}")
-                    sys.stdout.flush()
-
-                    await self.execute_trade('SELL', self.or_low, self.or_high)
+            # SELL BREAKOUT → place LIMIT order at OR Low (will fill on retest)
+            if close < self.or_low and not self.breakout_done['SELL'] and not self.pending_order_id:
+                if candle_range_pct >= BREAKOUT_PCT:
                     self.breakout_done['SELL'] = True
-                    self.trades_taken_today += 1
+                    print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Placing LIMIT SELL at OR Low...")
+                    sys.stdout.flush()
+                    self.pending_stop_level = self.or_high
+                    await self.place_limit_entry_order('SELL', self.or_low)
+                    if self.pending_order_id:
+                        print(f"⏳ LIMIT SELL at {self.or_low:.2f} online — will fill when price retests OR Low")
                     return
 
         except Exception as e:
@@ -631,21 +755,53 @@ class LiveORBSignals:
             sys.stdout.flush()
             return
 
-        order = await self.place_stop_entry_order(side, qty, entry_level)
+        # Check current mark price to decide order type
+        try:
+            ticker = await self.client.futures_symbol_ticker(symbol=SYMBOL)
+            mark_price = float(ticker['price'])
+            print(f"📊 Current mark price: {mark_price:.2f}, Entry level: {entry_level:.2f}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"⚠️ Could not fetch mark price, using STOP_MARKET: {e}")
+            sys.stdout.flush()
+            mark_price = None
+
+        use_market = False
+        if mark_price is not None:
+            if side == 'BUY' and mark_price >= entry_level:
+                use_market = True
+                print(f"⚡ Price {mark_price:.2f} already above entry {entry_level:.2f}. Using MARKET order instead of STOP_MARKET.")
+                sys.stdout.flush()
+            elif side == 'SELL' and mark_price <= entry_level:
+                use_market = True
+                print(f"⚡ Price {mark_price:.2f} already below entry {entry_level:.2f}. Using MARKET order instead of STOP_MARKET.")
+                sys.stdout.flush()
+
+        if use_market:
+            order = await self.place_market_entry_order(side, qty)
+        else:
+            order = await self.place_stop_entry_order(side, qty, entry_level)
+
         if not order:
-            print("❌ STOP entry order failed, trade aborted")
+            print(f"❌ {'MARKET' if use_market else 'STOP'} entry order failed, trade aborted")
             sys.stdout.flush()
             return
 
         order_id = order['orderId']
 
-        filled_order = await self.wait_for_stop_fill(order_id)
-        if not filled_order:
-            print(f"⚠️ STOP entry {order_id} not triggered. Order cancelled.")
-            sys.stdout.flush()
-            return
-
-        fill_price = float(filled_order['avgPrice'])
+        if use_market:
+            # MARKET order fills immediately, response contains fill price
+            fill_price = float(order.get('avgPrice', 0))
+            if fill_price == 0:
+                fill_price = mark_price or entry_level
+            filled_order = order
+        else:
+            filled_order = await self.wait_for_stop_fill(order_id)
+            if not filled_order:
+                print(f"⚠️ STOP entry {order_id} not triggered. Order cancelled.")
+                sys.stdout.flush()
+                return
+            fill_price = float(filled_order['avgPrice'])
         print(f"💵 Actual fill price: {fill_price:.2f}")
         sys.stdout.flush()
 
@@ -867,6 +1023,32 @@ class LiveORBSignals:
             print(f"⚠️ Error recovering active position: {e}")
             sys.stdout.flush()
 
+    async def recover_pending_orders(self):
+        try:
+            print("🔍 Checking for pending LIMIT orders...")
+            sys.stdout.flush()
+            open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+            for order in open_orders:
+                if order['type'] == 'LIMIT' and order['status'] == 'NEW':
+                    self.pending_order_id = order['orderId']
+                    self.pending_order_side = order['side']
+                    self.pending_entry_level = float(order['price'])
+                    self.pending_qty = float(order['origQty'])
+                    if self.pending_order_side == 'BUY':
+                        self.pending_stop_level = self.or_low
+                        side_print = 'BUY'
+                    else:
+                        self.pending_stop_level = self.or_high
+                        side_print = 'SELL'
+                    print(f"📌 Recovered pending LIMIT {side_print} order {self.pending_order_id} @ {self.pending_entry_level:.2f}")
+                    sys.stdout.flush()
+                    return
+            print("ℹ️ No pending LIMIT orders found")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"⚠️ Error recovering pending orders: {e}")
+            sys.stdout.flush()
+
     async def recover_trade_count(self):
         # Trade count recovery is disabled to avoid overcounting emergency exits.
         # The in-memory counter will be reset on each new day and increments correctly.
@@ -929,6 +1111,7 @@ class LiveORBSignals:
             await self.recover_opening_range()
             await self.recover_active_position()
             await self.recover_trade_count()
+            await self.recover_pending_orders()
 
             balance = await self.get_usdt_balance()
             print(f"💰 Account Balance: {balance:.2f} USDT")
@@ -989,12 +1172,17 @@ class LiveORBSignals:
                                         print(f"💓 Heartbeat: {ny_now.strftime('%H:%M:%S')} NY | "
                                               f"msgs={last_msg_count} | candles={candles_processed} | "
                                               f"OR={'SET' if self.or_set else 'WAITING'} | "
-                                              f"pos={'ACTIVE' if self.active_position else 'NONE'}")
+                                              f"pos={'ACTIVE' if self.active_position else 'NONE'} | "
+                                              f"pend={'YES' if self.pending_order_id else 'NO'}")
                                         sys.stdout.flush()
 
                                     if kline['x']:
                                         candles_processed += 1
                                         await self.process_closed_candle(kline, stream=s)
+                                    elif self.pending_order_id and not self.active_position:
+                                        filled = await self.check_pending_limit_fill()
+                                        if filled:
+                                            candles_processed += 1
                                 elif msg:
                                     print(f"⚠️ Non-kline message: {str(msg)[:200]}")
                                     sys.stdout.flush()
