@@ -144,7 +144,7 @@ class LiveORBSignals:
                 timeInForce='GTC'
             )
             order_id = order.get('orderId')
-            if order_id:
+            if order_id is not None:
                 self.pending_order_id = order_id
                 self.pending_order_side = side
                 self.pending_entry_level = price
@@ -171,7 +171,7 @@ class LiveORBSignals:
                 quantity=quantity,
             )
             order_id = order.get('orderId')
-            if order_id:
+            if order_id is not None:
                 print(f"✅ {side} STOP_MARKET entry placed! OrderID: {order_id}")
                 sys.stdout.flush()
                 return order
@@ -200,7 +200,7 @@ class LiveORBSignals:
                 quantity=quantity,
             )
             order_id = order.get('orderId')
-            if order_id:
+            if order_id is not None:
                 print(f"✅ {side} MARKET entry filled! OrderID: {order_id}, Price: {order.get('avgPrice', 'N/A')}")
                 sys.stdout.flush()
                 return order
@@ -244,6 +244,9 @@ class LiveORBSignals:
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
         tp_success = False
+        # Clear stale order IDs before fresh placement
+        self.sl_order_id = None
+        self.tp_order_id = None
 
         # Cancel any existing bot-placed SL/TP orders on the close side to avoid -4130.
         try:
@@ -284,9 +287,10 @@ class LiveORBSignals:
                     type='STOP_MARKET',
                     closePosition=True,
                     stopPrice=round(stop_price, PRICE_PRECISION),
+                    newOrderRespType='RESULT',
                 )
                 order_id = sl.get('orderId')
-                if order_id:
+                if order_id is not None:
                     self.sl_order_id = order_id
                     print(f"✅ SL placed successfully! ID: {order_id}")
                     sys.stdout.flush()
@@ -328,6 +332,10 @@ class LiveORBSignals:
             if tp_would_trigger:
                 print(f"⚠️ TP {tp_price:.2f} would trigger immediately (mark {mark_price:.2f}). Using MARKET order instead.")
                 sys.stdout.flush()
+                # Cancel any SL that was placed before MARKET exit to avoid ghost orders
+                if sl_success and self.sl_order_id:
+                    await self.cancel_order(self.sl_order_id)
+                    self.sl_order_id = None
                 try:
                     await self.client.futures_create_order(
                         symbol=SYMBOL,
@@ -337,8 +345,9 @@ class LiveORBSignals:
                     )
                     print(f"✅ TP executed via MARKET order at {mark_price:.2f}")
                     sys.stdout.flush()
-                    tp_success = True
-                    return sl_success, tp_success
+                    # Position is now fully closed — return (False, False) so caller
+                    # does NOT set active_position and triggers proper cleanup
+                    return False, False
                 except Exception as e:
                     print(f"❌ MARKET TP exit failed: {e}")
                     sys.stdout.flush()
@@ -368,9 +377,10 @@ class LiveORBSignals:
                     type='TAKE_PROFIT_MARKET',
                     closePosition=True,
                     stopPrice=round(tp_price, PRICE_PRECISION),
+                    newOrderRespType='RESULT',
                 )
                 order_id = tp.get('orderId')
-                if order_id:
+                if order_id is not None:
                     self.tp_order_id = order_id
                     print(f"✅ TP placed successfully! ID: {order_id}")
                     sys.stdout.flush()
@@ -418,7 +428,9 @@ class LiveORBSignals:
             order = await self.client.futures_get_order(symbol=SYMBOL, orderId=self.pending_order_id)
             status = order['status']
             if status == 'FILLED':
-                fill_price = float(order['avgPrice'])
+                fill_price = float(order.get('avgPrice', 0))
+                if fill_price == 0 and self.pending_entry_level is not None:
+                    fill_price = self.pending_entry_level
                 print(f"\n{'='*50}")
                 print(f"✅ LIMIT order {self.pending_order_id} FILLED @ {fill_price:.2f}!")
                 sys.stdout.flush()
@@ -536,10 +548,16 @@ class LiveORBSignals:
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    quantity=current_qty,
+                    closePosition=True,
                     stopPrice=round(new_sl, PRICE_PRECISION),
+                    newOrderRespType='RESULT',
                 )
-                self.sl_order_id = new_sl_order['orderId']
+                order_id = new_sl_order.get('orderId')
+                if order_id is not None:
+                    self.sl_order_id = order_id
+                else:
+                    print(f"⚠️ Breakeven SL response missing orderId")
+                    sys.stdout.flush()
                 print(f"✅ New SL at entry: {new_sl:.2f}")
                 sys.stdout.flush()
             except Exception as e:
@@ -841,6 +859,9 @@ class LiveORBSignals:
                 print(f"🚨 CRITICAL: Emergency exit failed! Error: {e}")
             sys.stdout.flush()
 
+            if self.sl_order_id:
+                await self.cancel_order(self.sl_order_id)
+                self.sl_order_id = None
             if self.tp_order_id:
                 await self.cancel_order(self.tp_order_id)
                 self.tp_order_id = None
