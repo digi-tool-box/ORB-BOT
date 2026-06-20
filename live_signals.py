@@ -279,13 +279,13 @@ class LiveORBSignals:
                     pass
                 await asyncio.sleep(0.5)
 
-                print(f"🛑 Placing SL {close_side} STOP_MARKET (closePosition) at {stop_price:.2f} (attempt {attempt+1})...")
+                print(f"🛑 Placing SL {close_side} STOP_MARKET qty={quantity} at {stop_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 sl = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    closePosition=True,
+                    quantity=quantity,
                     stopPrice=round(stop_price, PRICE_PRECISION),
                     newOrderRespType='RESULT',
                 )
@@ -323,10 +323,10 @@ class LiveORBSignals:
             sys.stdout.flush()
 
             tp_would_trigger = False
-            # TAKE_PROFIT_MARKET trigger: BUY triggers when mark >= stopPrice, SELL triggers when mark <= stopPrice
-            if close_side == 'BUY' and mark_price >= tp_price:
+            # TAKE_PROFIT_MARKET trigger: BUY triggers when mark <= stopPrice, SELL triggers when mark >= stopPrice
+            if close_side == 'BUY' and mark_price <= tp_price:
                 tp_would_trigger = True
-            elif close_side == 'SELL' and mark_price <= tp_price:
+            elif close_side == 'SELL' and mark_price >= tp_price:
                 tp_would_trigger = True
 
             if tp_would_trigger:
@@ -369,13 +369,13 @@ class LiveORBSignals:
                     pass
                 await asyncio.sleep(0.5)
 
-                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET (closePosition) at {tp_price:.2f} (attempt {attempt+1})...")
+                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET qty={quantity} at {tp_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 tp = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
-                    closePosition=True,
+                    quantity=quantity,
                     stopPrice=round(tp_price, PRICE_PRECISION),
                     newOrderRespType='RESULT',
                 )
@@ -452,6 +452,7 @@ class LiveORBSignals:
                 print(f"   Stop Loss: {stop:.2f} (Risk: {risk:.2f})")
                 print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
                 sys.stdout.flush()
+                await asyncio.sleep(1.5)
                 sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
                 if not sl_placed and not tp_placed:
                     print("🚨 CRITICAL: Both SL and TP failed! Emergency market exit...")
@@ -548,7 +549,7 @@ class LiveORBSignals:
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    closePosition=True,
+                    quantity=current_qty,
                     stopPrice=round(new_sl, PRICE_PRECISION),
                     newOrderRespType='RESULT',
                 )
@@ -841,6 +842,7 @@ class LiveORBSignals:
         print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
         sys.stdout.flush()
 
+        await asyncio.sleep(1.5)
         sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
 
         if not sl_placed and not tp_placed:

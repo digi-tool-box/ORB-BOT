@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+exports/
+trading_bot.log
+gcm-diagnose.log
