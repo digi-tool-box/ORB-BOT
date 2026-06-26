@@ -2,11 +2,17 @@ import pandas as pd
 from binance.client import Client
 from config import API_KEY, SECRET_KEY, SYMBOL, INTERVAL, START_DATE, END_DATE
 
-client = Client(API_KEY, SECRET_KEY, tld='com')
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = Client(API_KEY, SECRET_KEY, tld='com')
+    return _client
 
 def fetch_klines(start_str=None, end_str=None):
     """Download Binance Futures klines, return DataFrame."""
-    klines = client.futures_historical_klines(
+    klines = _get_client().futures_historical_klines(
         symbol=SYMBOL,
         interval=INTERVAL,
         start_str=start_str,

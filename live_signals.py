@@ -74,13 +74,11 @@ class LiveORBSignals:
 
     async def get_usdt_balance(self):
         try:
-            acc = await self.client.futures_account_balance()
-            for b in acc:
-                if b['asset'] == 'USDT':
-                    balance = float(b['balance'])
-                    print(f"💰 Available USDT Balance: {balance}")
-                    sys.stdout.flush()
-                    return balance
+            acc = await self.client.futures_account()
+            balance = float(acc['availableBalance'])
+            print(f"💰 Available USDT Balance: {balance}")
+            sys.stdout.flush()
+            return balance
         except Exception as e:
             print(f"⚠️ Balance fetch error: {e}")
             sys.stdout.flush()
@@ -166,7 +164,7 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
-    async def place_stop_entry_order(self, side, quantity, price=None):
+    async def place_market_entry_order(self, side, quantity):
         try:
             print(f"🚀 Placing {side} MARKET entry for {quantity} {SYMBOL}...")
             sys.stdout.flush()
@@ -180,29 +178,6 @@ class LiveORBSignals:
             if order_id is not None:
                 fill_price = float(order.get('avgPrice', 0))
                 print(f"✅ {side} MARKET entry filled! OrderID: {order_id}, Fill: {fill_price:.2f}")
-                sys.stdout.flush()
-                return order
-            print("⚠️ MARKET order placed but missing orderId in response")
-            sys.stdout.flush()
-            return None
-        except Exception as e:
-            print(f"❌ MARKET entry error: {e}")
-            sys.stdout.flush()
-            return None
-
-    async def place_market_entry_order(self, side, quantity):
-        try:
-            print(f"🚀 Placing {side} MARKET entry for {quantity} {SYMBOL}...")
-            sys.stdout.flush()
-            order = await self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=side,
-                type='MARKET',
-                quantity=quantity,
-            )
-            order_id = order.get('orderId')
-            if order_id is not None:
-                print(f"✅ {side} MARKET entry filled! OrderID: {order_id}, Price: {order.get('avgPrice', 'N/A')}")
                 sys.stdout.flush()
                 return order
             print("⚠️ MARKET order placed but missing orderId in response")
@@ -247,7 +222,6 @@ class LiveORBSignals:
                     side=close_side,
                     type='STOP_MARKET',
                     stopPrice=round(stop_price, PRICE_PRECISION),
-                    quantity=quantity,
                     closePosition='true',
                     newOrderRespType='RESULT',
                 )
@@ -313,7 +287,6 @@ class LiveORBSignals:
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
                     stopPrice=round(tp_price, PRICE_PRECISION),
-                    quantity=quantity,
                     closePosition='true',
                     newOrderRespType='RESULT',
                 )
@@ -499,8 +472,8 @@ class LiveORBSignals:
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    quantity=current_qty,
                     stopPrice=round(new_sl, PRICE_PRECISION),
+                    closePosition='true',
                     newOrderRespType='RESULT',
                 )
                 order_id = new_sl_order.get('orderId')
@@ -714,87 +687,6 @@ class LiveORBSignals:
         except Exception as e:
             print(f"❌ Error processing candle: {e}")
             sys.stdout.flush()
-
-    async def execute_trade(self, side, entry_level, stop_level):
-        balance = await self.get_usdt_balance()
-        qty = self.calculate_quantity(entry_level, stop_level, side, balance)
-
-        if qty <= 0:
-            print("⚠️ Invalid quantity, trade aborted")
-            sys.stdout.flush()
-            return
-
-        order = await self.place_stop_entry_order(side, qty)
-
-        if not order:
-            print(f"❌ MARKET entry order failed, trade aborted")
-            sys.stdout.flush()
-            return
-
-        fill_price = float(order.get('avgPrice', 0))
-        if fill_price == 0:
-            fill_price = entry_level
-        print(f"💵 Actual fill price: {fill_price:.2f}")
-        sys.stdout.flush()
-
-        if side == 'BUY':
-            stop = stop_level * (1 - SL_BUFFER_PCT/100)
-            risk = fill_price - stop
-            target = fill_price + risk * RISK_REWARD
-        else:
-            stop = stop_level * (1 + SL_BUFFER_PCT/100)
-            risk = stop - fill_price
-            target = fill_price - risk * RISK_REWARD
-
-        stop = self.validate_stop_distance(side, fill_price, stop)
-
-        print(f"\n📋 Trade Details:")
-        print(f"   Side: {side}")
-        print(f"   Entry (filled): {fill_price:.2f}")
-        print(f"   Stop Loss: {stop:.2f} (Risk: {risk:.2f})")
-        print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
-        sys.stdout.flush()
-
-        await asyncio.sleep(1.5)
-        sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
-
-        if not sl_placed and not tp_placed:
-            print("🚨 CRITICAL: Both SL and TP failed! Emergency market exit...")
-            sys.stdout.flush()
-            exit_side = 'SELL' if side == 'BUY' else 'BUY'
-            try:
-                await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=exit_side,
-                    type='MARKET',
-                    quantity=qty
-                )
-                print("🚨 Emergency market exit order placed!")
-            except Exception as e:
-                print(f"🚨 CRITICAL: Emergency exit failed! Error: {e}")
-            sys.stdout.flush()
-
-            if self.sl_order_id:
-                await self.cancel_order(self.sl_order_id)
-                self.sl_order_id = None
-            if self.tp_order_id:
-                await self.cancel_order(self.tp_order_id)
-                self.tp_order_id = None
-
-            self.active_position = None
-            return
-
-        self.active_position = {
-            'side': side,
-            'entry': fill_price,
-            'sl': stop,
-            'tp': target,
-            'breakeven_triggered': False
-        }
-
-        print(f"\n✅ {side} POSITION ACTIVE @ {fill_price:.2f} - Monitoring...")
-        print(f"{'='*50}\n")
-        sys.stdout.flush()
 
     async def recover_opening_range(self):
         try:

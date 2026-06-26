@@ -56,9 +56,10 @@ def simulate_trades(df, signals, capital, risk_pct):
     df = add_ny_session_column(df)
     equity = capital
 
-    # Parameters for Trailing and Breakeven
-    breakeven_trigger_pct = 0.2 / 100  # 0.2% profit par breakeven activate hoga
-    trailing_pct = 0.1 / 100           # 0.1% peeche trail karega
+    from config import BREAKEVEN_TRIGGER, TRAIL_STEP_PCT
+
+    breakeven_trigger_pct = BREAKEVEN_TRIGGER
+    trailing_pct = TRAIL_STEP_PCT
 
     for _, sig in signals.iterrows():
         entry = sig['entry']
