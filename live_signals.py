@@ -87,7 +87,7 @@ class LiveORBSignals:
         return INITIAL_CAPITAL
 
     def calculate_quantity(self, entry, stop, side, balance):
-        effective_balance = min(balance, INITIAL_CAPITAL)
+        effective_balance = balance
         risk_amount = effective_balance * (RISK_PER_TRADE_PCT / 100)
         risk_per_unit = abs(entry - stop)
         if risk_per_unit <= 0:
@@ -159,33 +159,27 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
-    async def place_stop_entry_order(self, side, quantity, stop_price):
+    async def place_stop_entry_order(self, side, quantity, price=None):
         try:
-            print(f"🚀 Placing {side} STOP_MARKET entry for {quantity} {SYMBOL} at {stop_price:.2f}...")
+            print(f"🚀 Placing {side} MARKET entry for {quantity} {SYMBOL}...")
             sys.stdout.flush()
             order = await self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=side,
-                type='STOP_MARKET',
-                stopPrice=round(stop_price, PRICE_PRECISION),
+                type='MARKET',
                 quantity=quantity,
             )
             order_id = order.get('orderId')
             if order_id is not None:
-                print(f"✅ {side} STOP_MARKET entry placed! OrderID: {order_id}")
+                fill_price = float(order.get('avgPrice', 0))
+                print(f"✅ {side} MARKET entry filled! OrderID: {order_id}, Fill: {fill_price:.2f}")
                 sys.stdout.flush()
                 return order
-            fallback = await self.client.futures_get_open_orders(symbol=SYMBOL)
-            for o in fallback:
-                if o['side'] == side and o['type'] == 'STOP_MARKET':
-                    print(f"✅ Entry order recovered from open orders! ID: {o['orderId']}")
-                    sys.stdout.flush()
-                    return o
-            print("⚠️ Entry order placed but missing orderId in response")
+            print("⚠️ MARKET order placed but missing orderId in response")
             sys.stdout.flush()
             return None
         except Exception as e:
-            print(f"❌ STOP_MARKET entry error: {e}")
+            print(f"❌ MARKET entry error: {e}")
             sys.stdout.flush()
             return None
 
@@ -212,43 +206,14 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
-    async def wait_for_stop_fill(self, order_id, timeout=300):
-        for i in range(timeout // 2):
-            await asyncio.sleep(2)
-            try:
-                order = await self.client.futures_get_order(symbol=SYMBOL, orderId=order_id)
-                status = order['status']
-                if status == 'FILLED':
-                    print(f"✅ STOP entry {order_id} filled! AvgPrice: {order['avgPrice']}")
-                    sys.stdout.flush()
-                    return order
-                elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
-                    print(f"❌ STOP entry {order_id} {status}")
-                    sys.stdout.flush()
-                    return None
-                elif status == 'NEW':
-                    print(f"⏳ STOP entry {order_id} waiting for trigger (status: {status})...")
-                    sys.stdout.flush()
-            except Exception as e:
-                print(f"⚠️ Stop order status check error: {e}")
-                sys.stdout.flush()
-        print(f"⏰ STOP entry {order_id} not triggered after {timeout}s timeout")
-        sys.stdout.flush()
-        try:
-            await self.cancel_order(order_id)
-        except:
-            pass
-        return None
-
-    async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=3):
+    async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=5):
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
         tp_success = False
-        # Clear stale order IDs before fresh placement
         self.sl_order_id = None
         self.tp_order_id = None
 
-        # Cancel any existing bot-placed SL/TP orders on the close side to avoid -4130.
+        # Cancel all existing SL/TP orders on the close side to avoid -4130
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for order in open_orders:
@@ -265,28 +230,18 @@ class LiveORBSignals:
 
         await asyncio.sleep(1.5)
 
-        # Place SL with closePosition=True (avoid quantity-related testnet bugs)
+        # Place SL with closePosition=True (ignores quantity, closes full position)
         for attempt in range(retries):
             try:
-                # Cancel existing SL orders before each attempt (fixes -4130)
-                try:
-                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
-                    for order in open_orders:
-                        if order['side'] == close_side and order['type'] in ('STOP_MARKET',):
-                            await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
-                            print(f"🗑️ Cancelled existing {order['type']} {order['orderId']}")
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
-
-                print(f"🛑 Placing SL {close_side} STOP_MARKET qty={quantity} at {stop_price:.2f} (attempt {attempt+1})...")
+                print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 sl = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
-                    quantity=quantity,
                     stopPrice=round(stop_price, PRICE_PRECISION),
+                    quantity=quantity,
+                    closePosition='true',
                     newOrderRespType='RESULT',
                 )
                 order_id = sl.get('orderId')
@@ -297,25 +252,15 @@ class LiveORBSignals:
                     sl_success = True
                     break
                 else:
-                    print(f"⚠️ SL response missing orderId, checking open orders...")
+                    print(f"⚠️ SL response missing orderId, retrying...")
                     sys.stdout.flush()
-                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
-                    for order in open_orders:
-                        if order['side'] == close_side and order['type'] == 'STOP_MARKET':
-                            self.sl_order_id = order['orderId']
-                            print(f"✅ SL identified from open orders! ID: {self.sl_order_id}")
-                            sys.stdout.flush()
-                            sl_success = True
-                            break
-                    if not sl_success:
-                        print("⚠️ Could not verify SL order on exchange")
             except Exception as e:
                 print(f"❌ SL attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
 
-        # Check current mark price before placing TP
+        # Check current mark price before placing TP (might have already hit TP)
         try:
             ticker = await self.client.futures_symbol_ticker(symbol=SYMBOL)
             mark_price = float(ticker['price'])
@@ -323,7 +268,6 @@ class LiveORBSignals:
             sys.stdout.flush()
 
             tp_would_trigger = False
-            # TAKE_PROFIT_MARKET trigger: BUY triggers when mark <= stopPrice, SELL triggers when mark >= stopPrice
             if close_side == 'BUY' and mark_price <= tp_price:
                 tp_would_trigger = True
             elif close_side == 'SELL' and mark_price >= tp_price:
@@ -332,7 +276,6 @@ class LiveORBSignals:
             if tp_would_trigger:
                 print(f"⚠️ TP {tp_price:.2f} would trigger immediately (mark {mark_price:.2f}). Using MARKET order instead.")
                 sys.stdout.flush()
-                # Cancel any SL that was placed before MARKET exit to avoid ghost orders
                 if sl_success and self.sl_order_id:
                     await self.cancel_order(self.sl_order_id)
                     self.sl_order_id = None
@@ -345,8 +288,6 @@ class LiveORBSignals:
                     )
                     print(f"✅ TP executed via MARKET order at {mark_price:.2f}")
                     sys.stdout.flush()
-                    # Position is now fully closed — return (False, False) so caller
-                    # does NOT set active_position and triggers proper cleanup
                     return False, False
                 except Exception as e:
                     print(f"❌ MARKET TP exit failed: {e}")
@@ -358,25 +299,15 @@ class LiveORBSignals:
         # Place TP with closePosition=True
         for attempt in range(retries):
             try:
-                # Cancel existing TP orders before each attempt (fixes -4130)
-                try:
-                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
-                    for order in open_orders:
-                        if order['side'] == close_side and order['type'] in ('TAKE_PROFIT_MARKET',):
-                            await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
-                            print(f"🗑️ Cancelled existing {order['type']} {order['orderId']}")
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
-
-                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET qty={quantity} at {tp_price:.2f} (attempt {attempt+1})...")
+                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET at {tp_price:.2f} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 tp = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
-                    quantity=quantity,
                     stopPrice=round(tp_price, PRICE_PRECISION),
+                    quantity=quantity,
+                    closePosition='true',
                     newOrderRespType='RESULT',
                 )
                 order_id = tp.get('orderId')
@@ -387,23 +318,35 @@ class LiveORBSignals:
                     tp_success = True
                     break
                 else:
-                    print(f"⚠️ TP response missing orderId, checking open orders...")
+                    print(f"⚠️ TP response missing orderId, retrying...")
                     sys.stdout.flush()
-                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
-                    for order in open_orders:
-                        if order['side'] == close_side and order['type'] == 'TAKE_PROFIT_MARKET':
-                            self.tp_order_id = order['orderId']
-                            print(f"✅ TP identified from open orders! ID: {self.tp_order_id}")
-                            sys.stdout.flush()
-                            tp_success = True
-                            break
-                    if not tp_success:
-                        print("⚠️ Could not verify TP order on exchange")
             except Exception as e:
                 print(f"❌ TP attempt {attempt+1} failed: {e}")
                 sys.stdout.flush()
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
+
+        # If both SL and TP placed, return success
+        if sl_success and tp_success:
+            return sl_success, tp_success
+
+        # Emergency MARKET exit if either SL or TP failed after all retries
+        if not sl_success or not tp_success:
+            print("🚨 CRITICAL: SL/TP placement incomplete! Emergency MARKET exit...")
+            sys.stdout.flush()
+            try:
+                await self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=close_side,
+                    type='MARKET',
+                    quantity=quantity,
+                )
+                print("✅ Emergency MARKET exit placed!")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"🚨 Emergency exit failed: {e}")
+                sys.stdout.flush()
+            return False, False
 
         return sl_success, tp_success
 
@@ -774,53 +717,16 @@ class LiveORBSignals:
             sys.stdout.flush()
             return
 
-        # Check current mark price to decide order type
-        try:
-            ticker = await self.client.futures_symbol_ticker(symbol=SYMBOL)
-            mark_price = float(ticker['price'])
-            print(f"📊 Current mark price: {mark_price:.2f}, Entry level: {entry_level:.2f}")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"⚠️ Could not fetch mark price, using STOP_MARKET: {e}")
-            sys.stdout.flush()
-            mark_price = None
-
-        use_market = False
-        if mark_price is not None:
-            if side == 'BUY' and mark_price >= entry_level:
-                use_market = True
-                print(f"⚡ Price {mark_price:.2f} already above entry {entry_level:.2f}. Using MARKET order instead of STOP_MARKET.")
-                sys.stdout.flush()
-            elif side == 'SELL' and mark_price <= entry_level:
-                use_market = True
-                print(f"⚡ Price {mark_price:.2f} already below entry {entry_level:.2f}. Using MARKET order instead of STOP_MARKET.")
-                sys.stdout.flush()
-
-        if use_market:
-            order = await self.place_market_entry_order(side, qty)
-        else:
-            order = await self.place_stop_entry_order(side, qty, entry_level)
+        order = await self.place_stop_entry_order(side, qty)
 
         if not order:
-            print(f"❌ {'MARKET' if use_market else 'STOP'} entry order failed, trade aborted")
+            print(f"❌ MARKET entry order failed, trade aborted")
             sys.stdout.flush()
             return
 
-        order_id = order['orderId']
-
-        if use_market:
-            # MARKET order fills immediately, response contains fill price
-            fill_price = float(order.get('avgPrice', 0))
-            if fill_price == 0:
-                fill_price = mark_price or entry_level
-            filled_order = order
-        else:
-            filled_order = await self.wait_for_stop_fill(order_id)
-            if not filled_order:
-                print(f"⚠️ STOP entry {order_id} not triggered. Order cancelled.")
-                sys.stdout.flush()
-                return
-            fill_price = float(filled_order['avgPrice'])
+        fill_price = float(order.get('avgPrice', 0))
+        if fill_price == 0:
+            fill_price = entry_level
         print(f"💵 Actual fill price: {fill_price:.2f}")
         sys.stdout.flush()
 
@@ -1165,7 +1071,7 @@ class LiveORBSignals:
             print("="*50 + "\n")
             sys.stdout.flush()
 
-            RECV_TIMEOUT = 360
+            RECV_TIMEOUT = 600
             last_msg_count = 0
             candles_processed = 0
 
