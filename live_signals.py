@@ -95,6 +95,10 @@ class LiveORBSignals:
             sys.stdout.flush()
             return 0
         qty = risk_amount / risk_per_unit
+        max_qty_by_margin = (balance * LEVERAGE) / entry
+        if qty > max_qty_by_margin:
+            print(f"⚠️ Qty {qty:.3f} exceeds margin capacity ({max_qty_by_margin:.3f}). Capping to {max_qty_by_margin:.3f}...")
+            qty = max_qty_by_margin
         print(f"📊 Qty Calc: EffectiveBal={effective_balance:.2f}, Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
         return round(qty, QUANTITY_PRECISION)
