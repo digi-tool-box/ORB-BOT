@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import sys
 import pandas as pd
@@ -101,7 +102,8 @@ class LiveORBSignals:
             qty = max_qty_by_margin
         print(f"📊 Qty Calc: EffectiveBal={effective_balance:.2f}, Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
-        return round(qty, QUANTITY_PRECISION)
+        precision_factor = 10 ** QUANTITY_PRECISION
+        return math.floor(qty * precision_factor) / precision_factor
 
     def validate_stop_distance(self, side, entry_price, stop_price, current_price=None):
         """
@@ -244,7 +246,6 @@ class LiveORBSignals:
                     side=close_side,
                     type='STOP_MARKET',
                     stopPrice=round(stop_price, PRICE_PRECISION),
-                    quantity=quantity,
                     closePosition='true',
                     newOrderRespType='RESULT',
                 )
@@ -292,7 +293,7 @@ class LiveORBSignals:
                     )
                     print(f"✅ TP executed via MARKET order at {mark_price:.2f}")
                     sys.stdout.flush()
-                    return False, False
+                    return False, True
                 except Exception as e:
                     print(f"❌ MARKET TP exit failed: {e}")
                     sys.stdout.flush()
@@ -310,7 +311,6 @@ class LiveORBSignals:
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
                     stopPrice=round(tp_price, PRICE_PRECISION),
-                    quantity=quantity,
                     closePosition='true',
                     newOrderRespType='RESULT',
                 )
