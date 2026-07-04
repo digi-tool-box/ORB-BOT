@@ -39,7 +39,7 @@ RISK_PER_TRADE_PCT = 1.0    # risk 1% of capital per trade
 # === LIVE TRADING INFRASTRUCTURE ===
 IS_TESTNET = True           # True for Testnet (Safe Mode), False for Real Money
 QUANTITY_PRECISION = 3      # Precision for BTC (e.g., 0.001)
-PRICE_PRECISION = 1         # Precision for BTC price (e.g., 50000.00)
+PRICE_PRECISION = 1         # Precision for BTC price (e.g., 50000.0)
 
 # === POSITION MANAGEMENT ===
 # Partial Exit Strategy
@@ -49,6 +49,10 @@ TP2_PCT = 1.0               # 1.0% profit pe remaining position exit (1:2)
 # Risk Protection
 BREAKEVEN_TRIGGER = 0.005   # Profit 0.5% reach hote hi SL ko entry pe shift karo
 TRAIL_STEP_PCT = 0.001      # Trailing step 0.1%
+
+# === TELEGRAM NOTIFICATIONS ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # @BotFather se lo
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # @userinfobot se lo
 
 # === DEBUG & LOGGING ===
 DEBUG_MODE = True           # set False to silence debug prints

@@ -1,12 +1,15 @@
 import asyncio
 import os
 import sys
+import signal
+import logging
 import pandas as pd
 import pytz
 from datetime import datetime, time
 from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
 from keep_alive import keep_alive
+from telegram_notifier import send_telegram
 
 load_dotenv()
 
@@ -14,8 +17,9 @@ from config import (
     SYMBOL, INTERVAL, NY_TIMEZONE, NY_OPEN_HOUR, NY_OPEN_MINUTE,
     SLIPPAGE_PCT, RISK_PER_TRADE_PCT, INITIAL_CAPITAL, LEVERAGE,
     BREAKOUT_PCT, RETEST_ZONE_PCT, RISK_REWARD, SL_BUFFER_PCT,
-    BREAKEVEN_TRIGGER, MAKER_FEE, TAKER_FEE,
-    MAX_TRADES_PER_DAY, DEBUG_MODE, QUANTITY_PRECISION, PRICE_PRECISION
+    BREAKEVEN_TRIGGER, TRAIL_STEP_PCT, MAKER_FEE, TAKER_FEE,
+    MAX_TRADES_PER_DAY, DEBUG_MODE, QUANTITY_PRECISION, PRICE_PRECISION,
+    LOG_FILE, IS_TESTNET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 )
 
 API_KEY = os.environ.get('API_KEY')
@@ -25,6 +29,14 @@ if not API_KEY or not SECRET_KEY:
     from config import API_KEY as CONFIG_API_KEY, SECRET_KEY as CONFIG_SECRET_KEY
     API_KEY = API_KEY or CONFIG_API_KEY
     SECRET_KEY = SECRET_KEY or CONFIG_SECRET_KEY
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 class LiveORBSignals:
     def __init__(self):
@@ -47,6 +59,34 @@ class LiveORBSignals:
         self.pending_entry_level = None
         self.pending_stop_level = None
         self.pending_qty = None
+        self._shutdown_requested = False
+        self.daily_pnl = 0.0
+        self.max_daily_loss_pct = 20.0
+
+    def notify(self, message):
+        send_telegram(message, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID)
+
+    async def shutdown(self):
+        """Graceful shutdown: close any open position and clean up."""
+        logger.info("Shutdown initiated")
+        print("\n🛑 SHUTDOWN initiated – protecting position...")
+        sys.stdout.flush()
+        self.notify("🔴 Bot SHUTTING DOWN")
+        if self.active_position:
+            await self.market_close_position(self.active_position['side'], reason="Bot shutdown")
+        if self.pending_order_id:
+            await self.cancel_order(self.pending_order_id)
+            self.pending_order_id = None
+        if self.client:
+            try:
+                await self.client.close_connection()
+                print("🔌 Connection closed")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        print("✅ Bot shutdown complete.")
+        self.notify("✅ Bot shutdown complete")
+        sys.stdout.flush()
 
     async def connect_with_retry(self, max_retries=5):
         """Attempt to connect to Binance Testnet with exponential backoff."""
@@ -54,9 +94,10 @@ class LiveORBSignals:
             try:
                 print(f"🔌 Connection attempt {attempt + 1}/{max_retries}...")
                 sys.stdout.flush()
-                client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=True)
+                net_name = "Testnet" if IS_TESTNET else "Mainnet"
+                client = await AsyncClient.create(API_KEY, SECRET_KEY, testnet=IS_TESTNET)
                 await client.ping()
-                print("✅ Connected to Binance Testnet successfully!")
+                print(f"✅ Connected to Binance {net_name} successfully!")
                 sys.stdout.flush()
                 return client
             except Exception as e:
@@ -128,41 +169,56 @@ class LiveORBSignals:
                 return new_stop
         return stop_price
 
-    async def place_limit_entry_order(self, side, price):
-        try:
-            balance = await self.get_usdt_balance()
-            stop_level = self.pending_stop_level
-            qty = self.calculate_quantity(price, stop_level, side, balance)
-            if qty <= 0:
-                print("⚠️ Invalid quantity, cannot place LIMIT order")
+    async def place_limit_entry_order(self, side, price, max_retries=5):
+        for attempt in range(max_retries):
+            try:
+                balance = await self.get_usdt_balance()
+                stop_level = self.pending_stop_level
+                qty = self.calculate_quantity(price, stop_level, side, balance)
+                if qty <= 0:
+                    print("⚠️ Invalid quantity, cannot place LIMIT order")
+                    sys.stdout.flush()
+                    return None
+                self.pending_qty = qty
+                print(f"🚀 Placing {side} LIMIT entry for {qty} {SYMBOL} at {price:.2f} (GTC)...")
+                sys.stdout.flush()
+                order = await self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=side,
+                    type='LIMIT',
+                    price=round(price, PRICE_PRECISION),
+                    quantity=qty,
+                    timeInForce='GTC'
+                )
+                order_id = order.get('orderId')
+                if order_id is not None:
+                    self.pending_order_id = order_id
+                    self.pending_order_side = side
+                    self.pending_entry_level = price
+                    print(f"✅ {side} LIMIT entry placed! OrderID: {order_id}")
+                    sys.stdout.flush()
+                    return order
+                print("⚠️ LIMIT order placed but missing orderId in response")
                 sys.stdout.flush()
                 return None
-            self.pending_qty = qty
-            print(f"🚀 Placing {side} LIMIT entry for {qty} {SYMBOL} at {price:.2f} (GTC)...")
-            sys.stdout.flush()
-            order = await self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=side,
-                type='LIMIT',
-                price=round(price, PRICE_PRECISION),
-                quantity=qty,
-                timeInForce='GTC'
-            )
-            order_id = order.get('orderId')
-            if order_id is not None:
-                self.pending_order_id = order_id
-                self.pending_order_side = side
-                self.pending_entry_level = price
-                print(f"✅ {side} LIMIT entry placed! OrderID: {order_id}")
-                sys.stdout.flush()
-                return order
-            print("⚠️ LIMIT order placed but missing orderId in response")
-            sys.stdout.flush()
-            return None
-        except Exception as e:
-            print(f"❌ LIMIT entry error: {e}")
-            sys.stdout.flush()
-            return None
+            except Exception as e:
+                error_str = str(e)
+                if "502 Bad Gateway" in error_str or "504" in error_str or "502" in error_str or "Bad Gateway" in error_str or "Gateway Timeout" in error_str or "CloudFront" in error_str or "Invalid JSON" in error_str:
+                    print(f"⚠️ LIMIT entry attempt {attempt + 1}/{max_retries} failed (server error): {e}")
+                    sys.stdout.flush()
+                    if attempt < max_retries - 1:
+                        wait = 5 * (attempt + 1)
+                        print(f"🔄 Retrying in {wait}s...")
+                        sys.stdout.flush()
+                        await asyncio.sleep(wait)
+                    else:
+                        print(f"❌ LIMIT entry failed after {max_retries} attempts")
+                        sys.stdout.flush()
+                        return None
+                else:
+                    print(f"❌ LIMIT entry error: {e}")
+                    sys.stdout.flush()
+                    return None
 
     async def place_market_entry_order(self, side, quantity):
         try:
@@ -188,6 +244,37 @@ class LiveORBSignals:
             sys.stdout.flush()
             return None
 
+    async def _cancel_all_close_orders(self, close_side):
+        """Cancel ALL orders on the close side to avoid -4130 conflicts."""
+        try:
+            open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+            for order in open_orders:
+                o_side = order['side']
+                o_type = order['type']
+                if o_side == close_side and o_type in ('STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT'):
+                    try:
+                        await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
+                        print(f"🗑️ Cancelled {o_type} order {order['orderId']}")
+                        logger.info(f"Cancelled {o_type} order {order['orderId']}")
+                    except Exception as cancel_err:
+                        if "Unknown order sent" not in str(cancel_err):
+                            print(f"⚠️ Could not cancel order {order['orderId']}: {cancel_err}")
+        except Exception as e:
+            print(f"⚠️ Error cancelling existing orders: {e}")
+        await asyncio.sleep(1)
+
+    async def _find_existing_exit_order(self, close_side, order_type, stop_price=None):
+        """Find existing exit order on Binance. Returns (orderId, stopPrice) or (None, None)."""
+        try:
+            open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+            for o in open_orders:
+                if o['side'] == close_side and o['type'] == order_type:
+                    if stop_price is None or abs(float(o.get('stopPrice', 0)) - stop_price) < 0.01:
+                        return o['orderId'], float(o.get('stopPrice', 0))
+        except Exception:
+            pass
+        return None, None
+
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=5):
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
@@ -195,24 +282,10 @@ class LiveORBSignals:
         self.sl_order_id = None
         self.tp_order_id = None
 
-        # Cancel all existing SL/TP orders on the close side to avoid -4130
-        try:
-            open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
-            for order in open_orders:
-                if order['side'] == close_side and order['type'] in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
-                    try:
-                        await self.client.futures_cancel_order(symbol=SYMBOL, orderId=order['orderId'])
-                        print(f"🗑️ Cancelled existing {order['type']} order {order['orderId']}")
-                    except Exception as cancel_err:
-                        if "Unknown order sent" not in str(cancel_err):
-                            print(f"⚠️ Could not cancel order {order['orderId']}: {cancel_err}")
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"⚠️ Error cancelling existing orders: {e}")
+        # Cancel ALL close-side orders to prevent -4130 conflict
+        await self._cancel_all_close_orders(close_side)
 
-        await asyncio.sleep(1.5)
-
-        # Place SL with closePosition=True (ignores quantity, closes full position)
+        # Place SL with closePosition=True
         for attempt in range(retries):
             try:
                 print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} (attempt {attempt+1})...")
@@ -233,15 +306,30 @@ class LiveORBSignals:
                     sl_success = True
                     break
                 else:
-                    print(f"⚠️ SL response missing orderId, retrying...")
+                    print(f"⚠️ SL response missing orderId, checking open orders...")
                     sys.stdout.flush()
+                    await asyncio.sleep(1)
+                    found_id, _ = await self._find_existing_exit_order(close_side, 'STOP_MARKET', stop_price)
+                    if found_id is not None:
+                        self.sl_order_id = found_id
+                        print(f"✅ SL confirmed via open orders! ID: {self.sl_order_id}")
+                        sys.stdout.flush()
+                        sl_success = True
+                        break
+                    await self._cancel_all_close_orders(close_side)
             except Exception as e:
-                print(f"❌ SL attempt {attempt+1} failed: {e}")
-                sys.stdout.flush()
-                if attempt < retries - 1:
+                error_str = str(e)
+                if "-4130" in error_str:
+                    print(f"❌ SL attempt {attempt+1} failed (-4130). Cancelling conflicting orders and retrying...")
+                    sys.stdout.flush()
+                    await self._cancel_all_close_orders(close_side)
+                else:
+                    print(f"❌ SL attempt {attempt+1} failed: {e}")
+                    sys.stdout.flush()
+                if not sl_success and attempt < retries - 1:
                     await asyncio.sleep(2)
 
-        # Check current mark price before placing TP (might have already hit TP)
+        # Check current mark price before placing TP
         try:
             ticker = await self.client.futures_symbol_ticker(symbol=SYMBOL)
             mark_price = float(ticker['price'])
@@ -255,24 +343,13 @@ class LiveORBSignals:
                 tp_would_trigger = True
 
             if tp_would_trigger:
-                print(f"⚠️ TP {tp_price:.2f} would trigger immediately (mark {mark_price:.2f}). Using MARKET order instead.")
+                print(f"⚠️ TP {tp_price:.2f} would trigger immediately (mark {mark_price:.2f}). Using MARKET close.")
                 sys.stdout.flush()
                 if sl_success and self.sl_order_id:
                     await self.cancel_order(self.sl_order_id)
                     self.sl_order_id = None
-                try:
-                    await self.client.futures_create_order(
-                        symbol=SYMBOL,
-                        side=close_side,
-                        type='MARKET',
-                        quantity=quantity,
-                    )
-                    print(f"✅ TP executed via MARKET order at {mark_price:.2f}")
-                    sys.stdout.flush()
-                    return False, False
-                except Exception as e:
-                    print(f"❌ MARKET TP exit failed: {e}")
-                    sys.stdout.flush()
+                await self.market_close_position(side, reason="TP would trigger immediately")
+                return False, False
         except Exception as e:
             print(f"⚠️ Could not fetch mark price: {e}")
             sys.stdout.flush()
@@ -308,27 +385,50 @@ class LiveORBSignals:
 
         # If both SL and TP placed, return success
         if sl_success and tp_success:
+            logger.info(f"SL/TP placed for {side} @ entry: {stop_price=}, {tp_price=}")
             return sl_success, tp_success
 
-        # Emergency MARKET exit if either SL or TP failed after all retries
+        # Emergency MARKET exit if either SL or TP failed
         if not sl_success or not tp_success:
-            print("🚨 CRITICAL: SL/TP placement incomplete! Emergency MARKET exit...")
+            print("🚨 CRITICAL: SL/TP placement incomplete! Checking if position still open...")
             sys.stdout.flush()
             try:
-                await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=close_side,
-                    type='MARKET',
-                    quantity=quantity,
-                )
-                print("✅ Emergency MARKET exit placed!")
-                sys.stdout.flush()
+                pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                pos_open = any(float(p['positionAmt']) != 0 for p in pos_info)
+                if pos_open:
+                    await self.market_close_position(side, reason="SL/TP placement incomplete")
+                else:
+                    print("ℹ️ Position already closed.")
+                    sys.stdout.flush()
             except Exception as e:
                 print(f"🚨 Emergency exit failed: {e}")
+                logger.error(f"Emergency exit failed: {e}")
                 sys.stdout.flush()
             return False, False
 
         return sl_success, tp_success
+
+    async def market_close_position(self, side, reason="emergency"):
+        """Close position using closePosition=true. Safer than quantity-based close."""
+        close_side = 'SELL' if side == 'BUY' else 'BUY'
+        try:
+            logger.info(f"Market close {side} position (reason: {reason})")
+            await self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=close_side,
+                type='MARKET',
+                closePosition='true',
+                newOrderRespType='RESULT',
+            )
+            print(f"✅ Position {side} closed via MARKET (reason: {reason})")
+            sys.stdout.flush()
+            self.active_position = None
+            return True
+        except Exception as e:
+            print(f"❌ Market close failed (reason: {reason}): {e}")
+            logger.error(f"Market close failed: {e}")
+            sys.stdout.flush()
+            return False
 
     async def cancel_order(self, order_id):
         if not order_id:
@@ -378,15 +478,19 @@ class LiveORBSignals:
                 await asyncio.sleep(1.5)
                 sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
                 if not sl_placed and not tp_placed:
-                    print("🚨 CRITICAL: Both SL and TP failed! Emergency market exit...")
+                    print("🚨 CRITICAL: Both SL and TP failed! Checking if position still open...")
                     sys.stdout.flush()
-                    close_side = 'SELL' if side == 'BUY' else 'BUY'
                     try:
-                        await self.client.futures_create_order(
-                            symbol=SYMBOL, side=close_side, type='MARKET', quantity=qty
-                        )
+                        pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                        pos_open = any(float(p['positionAmt']) != 0 for p in pos_info)
+                        if pos_open:
+                            await self.market_close_position(side, reason="Both SL/TP failed at fill")
+                        else:
+                            print("ℹ️ Position already closed.")
+                            sys.stdout.flush()
                     except Exception as e:
-                        print(f"🚨 Emergency exit failed: {e}")
+                        print(f"🚨 Emergency exit check failed: {e}")
+                        logger.error(f"Emergency exit failed after fill: {e}")
                     self.pending_order_id = None
                     return False
                 self.active_position = {
@@ -402,6 +506,7 @@ class LiveORBSignals:
                 print(f"\n✅ {side} POSITION ACTIVE @ {fill_price:.2f} - Monitoring...")
                 print(f"{'='*50}\n")
                 sys.stdout.flush()
+                self.notify(f"📈 TRADE ENTERED | {side} {qty} {SYMBOL}\nEntry: ${fill_price:.2f}\nSL: ${stop:.2f} | TP: ${target:.2f}\nRisk: ${risk:.2f} | RR: 1:{RISK_REWARD}")
                 return True
             elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
                 print(f"❌ Pending LIMIT order {self.pending_order_id} {status}")
@@ -423,26 +528,49 @@ class LiveORBSignals:
         current_sl = pos['sl']
 
         breakeven_trigger_pct = BREAKEVEN_TRIGGER
+        trailing_pct = TRAIL_STEP_PCT
 
         new_sl = current_sl
         update_needed = False
 
+        if side not in ('highest_high', 'lowest_low'):
+            pos['highest_high'] = pos.get('highest_high', pos['entry'])
+            pos['lowest_low'] = pos.get('lowest_low', pos['entry'])
+
         if side == 'BUY':
-            profit_pct = (candle_high - pos['entry']) / pos['entry']
+            if candle_high > pos['highest_high']:
+                pos['highest_high'] = candle_high
+            profit_pct = (pos['highest_high'] - pos['entry']) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
                 print(f"🟢 Breakeven triggered! Moving SL to entry: {new_sl:.2f}")
                 sys.stdout.flush()
+            if breakeven_triggered:
+                new_trail_sl = pos['highest_high'] * (1 - trailing_pct)
+                if new_trail_sl > new_sl:
+                    new_sl = new_trail_sl
+                    update_needed = True
+                    print(f"🔄 Trailing SL up to {new_sl:.2f} (highest: {pos['highest_high']:.2f})")
+                    sys.stdout.flush()
         else:
-            profit_pct = (pos['entry'] - candle_low) / pos['entry']
+            if candle_low < pos['lowest_low']:
+                pos['lowest_low'] = candle_low
+            profit_pct = (pos['entry'] - pos['lowest_low']) / pos['entry']
             if profit_pct >= breakeven_trigger_pct and not breakeven_triggered:
                 new_sl = pos['entry']
                 breakeven_triggered = True
                 update_needed = True
                 print(f"🟢 Breakeven triggered! Moving SL to entry: {new_sl:.2f}")
                 sys.stdout.flush()
+            if breakeven_triggered:
+                new_trail_sl = pos['lowest_low'] * (1 + trailing_pct)
+                if new_trail_sl < new_sl:
+                    new_sl = new_trail_sl
+                    update_needed = True
+                    print(f"🔄 Trailing SL down to {new_sl:.2f} (lowest: {pos['lowest_low']:.2f})")
+                    sys.stdout.flush()
 
         if update_needed:
             print(f"🔄 Updating SL: {current_sl:.2f} → {new_sl:.2f}")
@@ -490,6 +618,8 @@ class LiveORBSignals:
 
         self.active_position['breakeven_triggered'] = breakeven_triggered
         self.active_position['sl'] = new_sl
+        self.active_position['highest_high'] = pos.get('highest_high', pos['entry'])
+        self.active_position['lowest_low'] = pos.get('lowest_low', pos['entry'])
 
     async def check_position_status(self):
         if not self.active_position:
@@ -513,6 +643,18 @@ class LiveORBSignals:
             if not position_exists:
                 print("📴 Position closed! (SL/TP hit)")
                 sys.stdout.flush()
+                if self.active_position:
+                    exit_pnl = 0.0
+                    try:
+                        acc = await self.client.futures_account()
+                        for p in acc['positions']:
+                            if p['symbol'] == SYMBOL:
+                                exit_pnl = float(p.get('unRealizedProfit', 0))
+                                break
+                    except Exception:
+                        pass
+                    side = self.active_position['side']
+                    self.notify(f"📴 TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
                 self.active_position = None
                 if self.sl_order_id:
                     await self.cancel_order(self.sl_order_id)
@@ -526,19 +668,7 @@ class LiveORBSignals:
             if self.sl_order_id is None and current_qty > 0:
                 print("🚨 CRITICAL: Active position has no Stop Loss order! Forcing market close.")
                 sys.stdout.flush()
-                close_side = 'SELL' if self.active_position['side'] == 'BUY' else 'BUY'
-                try:
-                    await self.client.futures_create_order(
-                        symbol=SYMBOL,
-                        side=close_side,
-                        type='MARKET',
-                        quantity=current_qty
-                    )
-                    print("✅ Position closed via emergency market order.")
-                    self.active_position = None
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"❌ Failed to close position: {e}")
+                await self.market_close_position(self.active_position['side'], reason="No SL order")
                 return False
 
             return True
@@ -576,6 +706,7 @@ class LiveORBSignals:
                 self.or_high = None
                 self.or_low = None
                 self.trades_taken_today = 0
+                self.daily_pnl = 0.0
                 self.breakout_done = {'BUY': False, 'SELL': False}
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
@@ -593,28 +724,7 @@ class LiveORBSignals:
                 if self.active_position:
                     print("🕟 End of NY session – closing any open position.")
                     sys.stdout.flush()
-                    side = self.active_position['side']
-                    close_side = 'SELL' if side == 'BUY' else 'BUY'
-                    try:
-                        pos_info = await self.client.futures_position_information(symbol=SYMBOL)
-                        qty = 0.0
-                        for p in pos_info:
-                            amt = float(p['positionAmt'])
-                            if amt != 0:
-                                qty = abs(amt)
-                                break
-                        if qty > 0:
-                            await self.client.futures_create_order(
-                                symbol=SYMBOL,
-                                side=close_side,
-                                type='MARKET',
-                                quantity=qty
-                            )
-                            print("✅ Position closed at end of session.")
-                        self.active_position = None
-                        sys.stdout.flush()
-                    except Exception as e:
-                        print(f"❌ Failed to close position at EOD: {e}")
+                    await self.market_close_position(self.active_position['side'], reason="End of NY session")
                 return
 
             if self.active_position:
@@ -652,6 +762,12 @@ class LiveORBSignals:
             })
 
             if self.trades_taken_today >= MAX_TRADES_PER_DAY:
+                return
+
+            max_daily_loss = INITIAL_CAPITAL * (self.max_daily_loss_pct / 100)
+            if self.daily_pnl <= -max_daily_loss:
+                print(f"🚫 Max daily loss ({self.max_daily_loss_pct}%) reached. Stopping trading for the day.")
+                sys.stdout.flush()
                 return
 
             last = self.candles_today[-1]
@@ -738,6 +854,8 @@ class LiveORBSignals:
                 print(f"📚 Loaded {len(self.candles_today)} post-OR candles from history")
                 sys.stdout.flush()
 
+                # Track highest breakout state for placing LIMIT order if retest hasn't happened yet
+                breakout_candle_time = None
                 for candle in self.candles_today:
                     close = candle['close']
                     high = candle['high']
@@ -747,14 +865,51 @@ class LiveORBSignals:
                     if close > self.or_high and not self.breakout_detected['BUY']:
                         if candle_range_pct >= BREAKOUT_PCT:
                             self.breakout_detected['BUY'] = True
+                            breakout_candle_time = candle['ny_time']
                             print(f"📈 [Recovery] Detected BUY Breakout on candle at {candle['ny_time'].strftime('%H:%M')}")
                             sys.stdout.flush()
 
                     if close < self.or_low and not self.breakout_detected['SELL']:
                         if candle_range_pct >= BREAKOUT_PCT:
                             self.breakout_detected['SELL'] = True
+                            breakout_candle_time = candle['ny_time']
                             print(f"📉 [Recovery] Detected SELL Breakout on candle at {candle['ny_time'].strftime('%H:%M')}")
                             sys.stdout.flush()
+
+                # If a breakout was detected in history, check if retest already happened
+                if self.breakout_detected['BUY'] and not self.breakout_done['BUY']:
+                    retest_upper = self.or_high * (1 + RETEST_ZONE_PCT/100)
+                    retest_lower = self.or_high * (1 - RETEST_ZONE_PCT/100)
+                    retest_found = False
+                    for candle in self.candles_today:
+                        if candle['ny_time'] > breakout_candle_time:
+                            if candle['low'] <= retest_upper and candle['high'] >= retest_lower:
+                                retest_found = True
+                                break
+                    if retest_found:
+                        print(f"ℹ️ [Recovery] BUY retest already happened. Marking breakout_done (missed trade).")
+                        sys.stdout.flush()
+                        self.breakout_done['BUY'] = True
+                    else:
+                        print(f"ℹ️ [Recovery] BUY breakout pending retest. Will place LIMIT BUY if no active position.")
+                        sys.stdout.flush()
+
+                if self.breakout_detected['SELL'] and not self.breakout_done['SELL']:
+                    retest_upper = self.or_low * (1 + RETEST_ZONE_PCT/100)
+                    retest_lower = self.or_low * (1 - RETEST_ZONE_PCT/100)
+                    retest_found = False
+                    for candle in self.candles_today:
+                        if candle['ny_time'] > breakout_candle_time:
+                            if candle['high'] >= retest_lower and candle['low'] <= retest_upper:
+                                retest_found = True
+                                break
+                    if retest_found:
+                        print(f"ℹ️ [Recovery] SELL retest already happened. Marking breakout_done (missed trade).")
+                        sys.stdout.flush()
+                        self.breakout_done['SELL'] = True
+                    else:
+                        print(f"ℹ️ [Recovery] SELL breakout pending retest. Will place LIMIT SELL if no active position.")
+                        sys.stdout.flush()
             else:
                 print("ℹ️ Opening Range candle not found in history (market not open yet or older than 100 candles)")
                 sys.stdout.flush()
@@ -813,23 +968,8 @@ class LiveORBSignals:
                 if sl_price is None or tp_price is None:
                     print("🚨 Recovered position has incomplete SL/TP! Closing immediately to prevent loss.")
                     sys.stdout.flush()
-                    close_side = 'SELL' if side == 'BUY' else 'BUY'
-                    try:
-                        await self.client.futures_create_order(
-                            symbol=SYMBOL,
-                            side=close_side,
-                            type='MARKET',
-                            quantity=abs(active_amt)
-                        )
-                        print("✅ Position closed successfully. No active position tracked.")
-                        sys.stdout.flush()
-                        self.active_position = None
-                        return
-                    except Exception as e:
-                        print(f"❌ Failed to close position: {e}")
-                        sys.stdout.flush()
-                        self.active_position = None
-                        return
+                    await self.market_close_position(side, reason="Recovered with incomplete SL/TP")
+                    return
 
                 # Only if both orders exist, restore active_position
                 self.sl_order_id = sl_order_id
@@ -862,6 +1002,12 @@ class LiveORBSignals:
                     self.pending_order_side = order['side']
                     self.pending_entry_level = float(order['price'])
                     self.pending_qty = float(order['origQty'])
+                    if not self.or_set or self.or_high is None or self.or_low is None:
+                        print(f"⚠️ OR not set yet. Cannot recover stop level for LIMIT order. Cancelling order {self.pending_order_id}.")
+                        sys.stdout.flush()
+                        await self.cancel_order(self.pending_order_id)
+                        self.pending_order_id = None
+                        return
                     if self.pending_order_side == 'BUY':
                         self.pending_stop_level = self.or_low
                         side_print = 'BUY'
@@ -885,6 +1031,26 @@ class LiveORBSignals:
         sys.stdout.flush()
         self.trades_taken_today = 0
 
+    def validate_config(self):
+        errors = []
+        if BREAKOUT_PCT <= 0:
+            errors.append("BREAKOUT_PCT must be > 0")
+        if RETEST_ZONE_PCT < 0:
+            errors.append("RETEST_ZONE_PCT must be >= 0")
+        if RISK_REWARD <= 0:
+            errors.append("RISK_REWARD must be > 0")
+        if LEVERAGE < 1 or LEVERAGE > 125:
+            errors.append("LEVERAGE must be between 1-125")
+        if RISK_PER_TRADE_PCT <= 0 or RISK_PER_TRADE_PCT > 100:
+            errors.append("RISK_PER_TRADE_PCT must be between 0-100")
+        if INITIAL_CAPITAL <= 0:
+            errors.append("INITIAL_CAPITAL must be > 0")
+        if MAX_TRADES_PER_DAY < 1:
+            errors.append("MAX_TRADES_PER_DAY must be >= 1")
+        if BREAKEVEN_TRIGGER <= 0:
+            errors.append("BREAKEVEN_TRIGGER must be > 0")
+        return errors
+
     async def start(self):
         try:
             print("\n" + "="*50)
@@ -895,6 +1061,16 @@ class LiveORBSignals:
             if not API_KEY or not SECRET_KEY:
                 print("❌ ERROR: API_KEY or SECRET_KEY missing!")
                 print("Please set these in Render Environment Variables")
+                sys.stdout.flush()
+                return
+
+            config_errors = self.validate_config()
+            if config_errors:
+                for err in config_errors:
+                    print(f"❌ Config error: {err}")
+                    logger.error(f"Config validation failed: {err}")
+                sys.stdout.flush()
+                print("❌ Bot cannot start due to configuration errors.")
                 sys.stdout.flush()
                 return
 
@@ -936,6 +1112,14 @@ class LiveORBSignals:
                     print(f"⚠️ Position mode warning: {e}")
                 sys.stdout.flush()
 
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    asyncio.get_event_loop().add_signal_handler(
+                        sig, lambda: asyncio.create_task(self.shutdown())
+                    )
+                except NotImplementedError:
+                    pass
+
             await self.recover_opening_range()
             await self.recover_active_position()
             await self.recover_trade_count()
@@ -970,11 +1154,14 @@ class LiveORBSignals:
             print("="*50 + "\n")
             sys.stdout.flush()
 
+            net_name = "TESTNET" if IS_TESTNET else "MAINNET"
+            self.notify(f"🟢 Bot STARTED | {net_name} | {SYMBOL} | Balance: ${balance:.2f} | NY: {ny_now.strftime('%H:%M')} IST: {ist_now.strftime('%H:%M')}")
+
             RECV_TIMEOUT = 600
             last_msg_count = 0
             candles_processed = 0
 
-            while True:
+            while not self._shutdown_requested:
                 try:
                     self.bm = BinanceSocketManager(self.client)
                     stream = self.bm.kline_futures_socket(SYMBOL, interval=INTERVAL)
@@ -983,7 +1170,7 @@ class LiveORBSignals:
                     sys.stdout.flush()
 
                     async with stream as s:
-                        while True:
+                        while not self._shutdown_requested:
                             try:
                                 msg = await asyncio.wait_for(s.recv(), timeout=RECV_TIMEOUT)
                                 last_msg_count += 1
@@ -1024,16 +1211,22 @@ class LiveORBSignals:
                             except asyncio.CancelledError:
                                 print("🛑 Bot shutdown requested")
                                 sys.stdout.flush()
-                                return
+                                self._shutdown_requested = True
+                                break
 
                 except asyncio.CancelledError:
                     print("🛑 Bot shutdown requested")
                     sys.stdout.flush()
-                    return
+                    self._shutdown_requested = True
+                    break
 
                 except Exception as e:
                     print(f"⚠️ WebSocket/stream error: {e}")
+                    logger.error(f"WebSocket error: {e}")
                     sys.stdout.flush()
+
+                if self._shutdown_requested:
+                    break
 
                 print("🔄 Reconnecting in 5 seconds...")
                 sys.stdout.flush()
@@ -1048,6 +1241,11 @@ class LiveORBSignals:
                     self.client = await self.connect_with_retry(max_retries=3)
                     print("✅ Reconnected to Binance successfully!")
                     sys.stdout.flush()
+                    # Recover state after reconnect
+                    if not self.or_set:
+                        await self.recover_opening_range()
+                    await self.recover_active_position()
+                    await self.recover_pending_orders()
                 except Exception as reconnect_error:
                     print(f"❌ Reconnection failed after retries: {reconnect_error}")
                     print("🔄 Retrying in 30 seconds...")
@@ -1060,11 +1258,9 @@ class LiveORBSignals:
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
+            self.notify(f"🔥 FATAL ERROR | Bot crashed\n{e}")
         finally:
-            if self.client:
-                await self.client.close_connection()
-                print("🔌 Connection closed")
-                sys.stdout.flush()
+            await self.shutdown()
 
 
 if __name__ == "__main__":
@@ -1078,17 +1274,23 @@ if __name__ == "__main__":
     print("\n🚀 Initializing ORB Trading Bot...")
     sys.stdout.flush()
 
-    try:
+    while True:
         bot = LiveORBSignals()
-        asyncio.run(bot.start())
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
-        sys.stdout.flush()
-    except Exception as e:
-        print(f"\n❌ Bot crashed: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            asyncio.run(bot.start())
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped by user (KeyboardInterrupt)")
+            sys.stdout.flush()
+            break
+        except Exception as e:
+            print(f"\n❌ Bot crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+            logger.error(f"Bot crashed: {e}", exc_info=True)
+        finally:
+            logger.info("Bot session ended")
+        print("🔄 Restarting bot in 10 seconds...")
         sys.stdout.flush()
         import time
-        while True:
-            time.sleep(60)
+        time.sleep(10)

@@ -26,7 +26,7 @@ def calculate_metrics(trades_df, initial_capital=10000):
         "win_rate": round(win_rate, 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
-        "profit_factor": round(profit_factor, 2) if profit_factor != np.inf else "∞",
+        "profit_factor": round(profit_factor, 2) if profit_factor != np.inf else "inf",
         "net_pnl": round(net_pnl, 2),
         "max_drawdown": round(max_drawdown * 100, 2),
         "sharpe_ratio": round(sharpe, 2),

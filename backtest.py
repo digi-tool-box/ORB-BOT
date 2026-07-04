@@ -9,8 +9,8 @@ from performance import calculate_metrics, plot_equity, export_trades, export_me
 # Sabhi config variables yahan ek hi baar mein import kiye gaye hain
 from config import (
     START_DATE, END_DATE, SYMBOL, INTERVAL, 
-    INITIAL_CAPITAL, RISK_PER_TRADE_PCT, 
-    SLIPPAGE_PCT
+    INITIAL_CAPITAL, RISK_PER_TRADE_PCT, LEVERAGE,
+    SLIPPAGE_PCT, MAKER_FEE, TAKER_FEE
 )
 
 def prepare_binance_data(df):
@@ -76,7 +76,10 @@ def simulate_trades(df, signals, capital, risk_pct):
         
         risk_per_unit = abs(entry - current_sl)
         risk_amount = equity * (risk_pct / 100)
-        qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+        max_position_value = equity * LEVERAGE
+        qty_risk = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+        qty_margin = max_position_value / entry if entry > 0 else float('inf')
+        qty = min(qty_risk, qty_margin)
         entry_time = sig['entry_time']
         
         post_entry = df[df.index >= entry_time]
@@ -106,15 +109,21 @@ def simulate_trades(df, signals, capital, risk_pct):
 
                 # --- EXIT CONDITIONS ---
                 if candle['low'] <= current_sl:
-                    pnl = (current_sl - entry) * qty
+                    exit_price = current_sl
+                    pnl = (exit_price - entry) * qty
+                    maker_fee = entry * qty * (MAKER_FEE / 100)
+                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
+                    total_fees = maker_fee + taker_fee
+                    pnl -= total_fees
                     outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
                     trades.append({
                         'entry_time': entry_time,
                         'exit_time': idx,
                         'type': 'BUY',
                         'entry': entry,
-                        'exit': current_sl,
+                        'exit': exit_price,
                         'pnl': pnl,
+                        'fees': round(total_fees, 2),
                         'outcome': outcome,
                         'qty': qty
                     })
@@ -122,14 +131,20 @@ def simulate_trades(df, signals, capital, risk_pct):
                     break
                     
                 if candle['high'] >= target:
-                    pnl = (target - entry) * qty
+                    exit_price = target
+                    pnl = (exit_price - entry) * qty
+                    maker_fee = entry * qty * (MAKER_FEE / 100)
+                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
+                    total_fees = maker_fee + taker_fee
+                    pnl -= total_fees
                     trades.append({
                         'entry_time': entry_time,
                         'exit_time': idx,
                         'type': 'BUY',
                         'entry': entry,
-                        'exit': target,
+                        'exit': exit_price,
                         'pnl': pnl,
+                        'fees': round(total_fees, 2),
                         'outcome': 'TP',
                         'qty': qty
                     })
@@ -155,15 +170,21 @@ def simulate_trades(df, signals, capital, risk_pct):
 
                 # --- EXIT CONDITIONS ---
                 if candle['high'] >= current_sl:
-                    pnl = (entry - current_sl) * qty
+                    exit_price = current_sl
+                    pnl = (entry - exit_price) * qty
+                    maker_fee = entry * qty * (MAKER_FEE / 100)
+                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
+                    total_fees = maker_fee + taker_fee
+                    pnl -= total_fees
                     outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
                     trades.append({
                         'entry_time': entry_time,
                         'exit_time': idx,
                         'type': 'SELL',
                         'entry': entry,
-                        'exit': current_sl,
+                        'exit': exit_price,
                         'pnl': pnl,
+                        'fees': round(total_fees, 2),
                         'outcome': outcome,
                         'qty': qty
                     })
@@ -171,14 +192,20 @@ def simulate_trades(df, signals, capital, risk_pct):
                     break
                     
                 if candle['low'] <= target:
-                    pnl = (entry - target) * qty
+                    exit_price = target
+                    pnl = (entry - exit_price) * qty
+                    maker_fee = entry * qty * (MAKER_FEE / 100)
+                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
+                    total_fees = maker_fee + taker_fee
+                    pnl -= total_fees
                     trades.append({
                         'entry_time': entry_time,
                         'exit_time': idx,
                         'type': 'SELL',
                         'entry': entry,
-                        'exit': target,
+                        'exit': exit_price,
                         'pnl': pnl,
+                        'fees': round(total_fees, 2),
                         'outcome': 'TP',
                         'qty': qty
                     })
