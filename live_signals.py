@@ -64,10 +64,6 @@ class LiveORBSignals:
         self.max_daily_loss_pct = 20.0
 
     def notify(self, message):
-        token_ok = bool(TELEGRAM_BOT_TOKEN)
-        chat_ok = bool(TELEGRAM_CHAT_ID)
-        print(f"📨 Telegram notify: token={'SET' if token_ok else 'MISSING'}, chat={'SET' if chat_ok else 'MISSING'}")
-        sys.stdout.flush()
         send_telegram(message, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID)
 
     async def shutdown(self):
