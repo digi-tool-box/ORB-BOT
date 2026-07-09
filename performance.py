@@ -13,7 +13,8 @@ def calculate_metrics(trades_df, initial_capital=10000):
     net_pnl = trades_df['pnl'].sum()
     win_rate = len(wins) / len(trades_df) * 100
     profit_factor = gross_profit / gross_loss if gross_loss != 0 else np.inf
-    equity = initial_capital + trades_df['pnl'].cumsum()
+    equity = pd.Series(initial_capital + trades_df['pnl'].cumsum().values,
+                       index=pd.to_datetime(trades_df['exit_time']))
     rolling_max = equity.cummax()
     drawdown = (equity - rolling_max) / rolling_max
     max_drawdown = drawdown.min()
