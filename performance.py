@@ -17,8 +17,9 @@ def calculate_metrics(trades_df, initial_capital=10000):
     rolling_max = equity.cummax()
     drawdown = (equity - rolling_max) / rolling_max
     max_drawdown = drawdown.min()
-    returns = trades_df['pnl'] / initial_capital
-    sharpe = returns.mean() / returns.std() * np.sqrt(252*24*12) if returns.std() != 0 else 0
+    daily_equity = equity.resample('D').last().ffill()
+    daily_returns = daily_equity.pct_change().dropna()
+    sharpe = daily_returns.mean() / daily_returns.std() * np.sqrt(252) if daily_returns.std() != 0 and not daily_returns.empty else 0
     return {
         "total_trades": len(trades_df),
         "winning_trades": len(wins),
