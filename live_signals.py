@@ -776,28 +776,34 @@ class LiveORBSignals:
             low = last['low']
             candle_range_pct = ((high - low) / low) * 100
 
-            # BUY BREAKOUT → place LIMIT order at OR High (will fill on retest)
+            # BUY BREAKOUT → place LIMIT order within retest zone above OR High
             if close > self.or_high and not self.breakout_done['BUY'] and not self.pending_order_id:
                 if candle_range_pct >= BREAKOUT_PCT:
-                    self.breakout_done['BUY'] = True
-                    print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Placing LIMIT BUY at OR High...")
+                    print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Placing LIMIT BUY within retest zone...")
                     sys.stdout.flush()
                     self.pending_stop_level = self.or_low
-                    await self.place_limit_entry_order('BUY', self.or_high)
+                    buy_limit_price = self.or_high * (1 + RETEST_ZONE_PCT/100)
+                    await self.place_limit_entry_order('BUY', buy_limit_price)
                     if self.pending_order_id:
-                        print(f"⏳ LIMIT BUY at {self.or_high:.2f} online — will fill when price retests OR High")
+                        self.breakout_done['BUY'] = True
+                        print(f"⏳ LIMIT BUY at {buy_limit_price:.2f} online — will fill when price retests OR High (zone ±{RETEST_ZONE_PCT}%)")
+                    else:
+                        print(f"⚠️ LIMIT BUY failed, will retry on next candle")
                     return
 
-            # SELL BREAKOUT → place LIMIT order at OR Low (will fill on retest)
+            # SELL BREAKOUT → place LIMIT order within retest zone below OR Low
             if close < self.or_low and not self.breakout_done['SELL'] and not self.pending_order_id:
                 if candle_range_pct >= BREAKOUT_PCT:
-                    self.breakout_done['SELL'] = True
-                    print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Placing LIMIT SELL at OR Low...")
+                    print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Placing LIMIT SELL within retest zone...")
                     sys.stdout.flush()
                     self.pending_stop_level = self.or_high
-                    await self.place_limit_entry_order('SELL', self.or_low)
+                    sell_limit_price = self.or_low * (1 - RETEST_ZONE_PCT/100)
+                    await self.place_limit_entry_order('SELL', sell_limit_price)
                     if self.pending_order_id:
-                        print(f"⏳ LIMIT SELL at {self.or_low:.2f} online — will fill when price retests OR Low")
+                        self.breakout_done['SELL'] = True
+                        print(f"⏳ LIMIT SELL at {sell_limit_price:.2f} online — will fill when price retests OR Low (zone ±{RETEST_ZONE_PCT}%)")
+                    else:
+                        print(f"⚠️ LIMIT SELL failed, will retry on next candle")
                     return
 
         except Exception as e:
