@@ -134,7 +134,7 @@ class LiveORBSignals:
             sys.stdout.flush()
             return 0
         qty_risk = risk_amount / risk_per_unit
-        max_position_value = balance * LEVERAGE
+        max_position_value = balance * LEVERAGE * 0.95  # 5% buffer for margin safety
         qty_margin = max_position_value / entry if entry > 0 else float('inf')
         qty = min(qty_risk, qty_margin)
         if qty < qty_risk:
