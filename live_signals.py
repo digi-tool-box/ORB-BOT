@@ -214,10 +214,12 @@ class LiveORBSignals:
                     else:
                         print(f"❌ LIMIT entry failed after {max_retries} attempts")
                         sys.stdout.flush()
+                        self.notify(f"❌ LIMIT entry failed | {side} {SYMBOL} @ {price:.2f}\n{error_str[:200]}")
                         return None
                 else:
                     print(f"❌ LIMIT entry error: {e}")
                     sys.stdout.flush()
+                    self.notify(f"❌ LIMIT entry failed | {side} {SYMBOL} @ {price:.2f}\n{str(e)[:200]}")
                     return None
 
     async def place_market_entry_order(self, side, quantity):
@@ -390,8 +392,10 @@ class LiveORBSignals:
 
         # Emergency MARKET exit if either SL or TP failed
         if not sl_success or not tp_success:
-            print("🚨 CRITICAL: SL/TP placement incomplete! Checking if position still open...")
+            msg = f"🚨 SL/TP failed | {side} {SYMBOL}\nSL={'✅' if sl_success else '❌'} TP={'✅' if tp_success else '❌'}"
+            print(msg)
             sys.stdout.flush()
+            self.notify(msg)
             try:
                 pos_info = await self.client.futures_position_information(symbol=SYMBOL)
                 pos_open = any(float(p['positionAmt']) != 0 for p in pos_info)
@@ -401,9 +405,11 @@ class LiveORBSignals:
                     print("ℹ️ Position already closed.")
                     sys.stdout.flush()
             except Exception as e:
-                print(f"🚨 Emergency exit failed: {e}")
-                logger.error(f"Emergency exit failed: {e}")
+                err_msg = f"🚨 Emergency exit failed: {e}"
+                print(err_msg)
+                logger.error(err_msg)
                 sys.stdout.flush()
+                self.notify(err_msg)
             return False, False
 
         return sl_success, tp_success
@@ -428,6 +434,7 @@ class LiveORBSignals:
             print(f"❌ Market close failed (reason: {reason}): {e}")
             logger.error(f"Market close failed: {e}")
             sys.stdout.flush()
+            self.notify(f"❌ Market close failed | {reason}\n{str(e)[:200]}")
             return False
 
     async def cancel_order(self, order_id):
@@ -480,6 +487,7 @@ class LiveORBSignals:
                 if not sl_placed and not tp_placed:
                     print("🚨 CRITICAL: Both SL and TP failed! Checking if position still open...")
                     sys.stdout.flush()
+                    self.notify(f"🚨 Both SL/TP failed after fill | {side} {SYMBOL}")
                     try:
                         pos_info = await self.client.futures_position_information(symbol=SYMBOL)
                         pos_open = any(float(p['positionAmt']) != 0 for p in pos_info)
@@ -493,12 +501,18 @@ class LiveORBSignals:
                         logger.error(f"Emergency exit failed after fill: {e}")
                     self.pending_order_id = None
                     return False
+                try:
+                    acc = await self.client.futures_account()
+                    entry_wallet = float(acc['totalWalletBalance'])
+                except Exception:
+                    entry_wallet = None
                 self.active_position = {
                     'side': side,
                     'entry': fill_price,
                     'sl': stop,
                     'tp': target,
-                    'breakeven_triggered': False
+                    'breakeven_triggered': False,
+                    'entry_wallet': entry_wallet
                 }
                 order_id = self.pending_order_id
                 self.pending_order_id = None
@@ -510,6 +524,7 @@ class LiveORBSignals:
                 return True
             elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
                 print(f"❌ Pending LIMIT order {self.pending_order_id} {status}")
+                self.notify(f"❌ LIMIT order {status} | {self.pending_order_side} {SYMBOL}")
                 self.pending_order_id = None
                 return False
             return False
@@ -644,17 +659,19 @@ class LiveORBSignals:
                 print("📴 Position closed! (SL/TP hit)")
                 sys.stdout.flush()
                 if self.active_position:
-                    exit_pnl = 0.0
-                    try:
-                        acc = await self.client.futures_account()
-                        for p in acc['positions']:
-                            if p['symbol'] == SYMBOL:
-                                exit_pnl = float(p.get('unRealizedProfit', 0))
-                                break
-                    except Exception:
-                        pass
+                    entry_wallet = self.active_position.get('entry_wallet')
+                    if entry_wallet is not None:
+                        try:
+                            acc = await self.client.futures_account()
+                            current_wallet = float(acc['totalWalletBalance'])
+                            exit_pnl = round(current_wallet - entry_wallet, 2)
+                        except Exception:
+                            exit_pnl = 0.0
+                    else:
+                        exit_pnl = 0.0
                     side = self.active_position['side']
-                    self.notify(f"📴 TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
+                    icon = "🟢" if exit_pnl >= 0 else "🔴"
+                    self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
                 self.active_position = None
                 if self.sl_order_id:
                     await self.cancel_order(self.sl_order_id)
@@ -666,9 +683,11 @@ class LiveORBSignals:
 
             # SAFETY: If no SL order exists for this position, close immediately
             if self.sl_order_id is None and current_qty > 0:
+                side = self.active_position['side']
                 print("🚨 CRITICAL: Active position has no Stop Loss order! Forcing market close.")
                 sys.stdout.flush()
-                await self.market_close_position(self.active_position['side'], reason="No SL order")
+                self.notify(f"🚨 No SL order | {side} {SYMBOL}\nClosing position immediately")
+                await self.market_close_position(side, reason="No SL order")
                 return False
 
             return True
@@ -809,6 +828,7 @@ class LiveORBSignals:
         except Exception as e:
             print(f"❌ Error processing candle: {e}")
             sys.stdout.flush()
+            self.notify(f"❌ Candle processing error\n{str(e)[:200]}")
 
     async def recover_opening_range(self):
         try:
@@ -974,6 +994,7 @@ class LiveORBSignals:
                 if sl_price is None or tp_price is None:
                     print("🚨 Recovered position has incomplete SL/TP! Closing immediately to prevent loss.")
                     sys.stdout.flush()
+                    self.notify(f"🚨 Recovered {side} position with incomplete SL/TP\nClosing to prevent loss")
                     await self.market_close_position(side, reason="Recovered with incomplete SL/TP")
                     return
 
