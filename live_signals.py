@@ -125,8 +125,8 @@ class LiveORBSignals:
             sys.stdout.flush()
         return INITIAL_CAPITAL
 
-    def calculate_quantity(self, entry, stop, side, balance, safety_pct=20):
-        max_margin_use = balance * (1 - safety_pct / 100)
+    def calculate_quantity(self, entry, stop, side, balance):
+        max_margin_use = balance * 0.98
         max_qty_by_margin = (max_margin_use * LEVERAGE) / entry if entry > 0 else 0
         risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
         risk_per_unit = abs(entry - stop)
@@ -140,7 +140,7 @@ class LiveORBSignals:
             print(f"⚠️ Risk-based qty ({qty_by_risk:.3f}) exceeds margin limit ({max_qty_by_margin:.3f}). Capping to {qty:.3f}")
             sys.stdout.flush()
         print(f"📊 Qty Calc: Balance={balance:.2f}, Leverage={LEVERAGE}x, "
-              f"MarginUse={max_margin_use:.2f} ({100-safety_pct}%), "
+              f"MarginUse={max_margin_use:.2f} (98%), "
               f"Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
         return round(qty, QUANTITY_PRECISION)
