@@ -125,23 +125,23 @@ class LiveORBSignals:
             sys.stdout.flush()
         return INITIAL_CAPITAL
 
-    def calculate_quantity(self, entry, stop, side, balance):
-        effective_balance = balance
-        risk_amount = effective_balance * (RISK_PER_TRADE_PCT / 100)
+    def calculate_quantity(self, entry, stop, side, balance, safety_pct=20):
+        max_margin_use = balance * (1 - safety_pct / 100)
+        max_qty_by_margin = (max_margin_use * LEVERAGE) / entry if entry > 0 else 0
+        risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
         risk_per_unit = abs(entry - stop)
         if risk_per_unit <= 0:
             print("⚠️ Risk per unit is zero, cannot calculate quantity")
             sys.stdout.flush()
             return 0
-        qty_risk = risk_amount / risk_per_unit
-        max_position_value = balance * LEVERAGE * 0.95  # 5% buffer for margin safety
-        qty_margin = max_position_value / entry if entry > 0 else float('inf')
-        qty = min(qty_risk, qty_margin)
-        if qty < qty_risk:
-            print(f"⚠️ Risk-based qty ({qty_risk:.3f}) exceeds margin limit ({qty_margin:.3f}). Capping to {qty:.3f}")
+        qty_by_risk = risk_amount / risk_per_unit
+        qty = min(qty_by_risk, max_qty_by_margin)
+        if qty < qty_by_risk:
+            print(f"⚠️ Risk-based qty ({qty_by_risk:.3f}) exceeds margin limit ({max_qty_by_margin:.3f}). Capping to {qty:.3f}")
             sys.stdout.flush()
-        print(f"📊 Qty Calc: EffectiveBal={effective_balance:.2f}, Leverage={LEVERAGE}x, Risk={risk_amount:.2f}, "
-              f"Risk/Unit={risk_per_unit:.2f}, MaxPosValue={max_position_value:.2f}, Qty={qty:.3f}")
+        print(f"📊 Qty Calc: Balance={balance:.2f}, Leverage={LEVERAGE}x, "
+              f"MarginUse={max_margin_use:.2f} ({100-safety_pct}%), "
+              f"Risk={risk_amount:.2f}, Risk/Unit={risk_per_unit:.2f}, Qty={qty:.3f}")
         sys.stdout.flush()
         return round(qty, QUANTITY_PRECISION)
 
