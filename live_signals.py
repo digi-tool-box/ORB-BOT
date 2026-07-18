@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import signal
+import time
 import logging
 import pandas as pd
 import pytz
@@ -287,17 +288,17 @@ class LiveORBSignals:
         # Cancel ALL close-side orders to prevent -4130 conflict
         await self._cancel_all_close_orders(close_side)
 
-        # Place SL with closePosition=True
+        # Place SL with quantity (NOT closePosition — avoids -4130 conflict)
         for attempt in range(retries):
             try:
-                print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} (attempt {attempt+1})...")
+                print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} for {quantity} {SYMBOL} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 sl = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='STOP_MARKET',
                     stopPrice=round(stop_price, PRICE_PRECISION),
-                    closePosition='true',
+                    quantity=quantity,
                     newOrderRespType='RESULT',
                 )
                 order_id = sl.get('orderId')
@@ -356,17 +357,17 @@ class LiveORBSignals:
             print(f"⚠️ Could not fetch mark price: {e}")
             sys.stdout.flush()
 
-        # Place TP with closePosition=True
+        # Place TP with quantity (NOT closePosition — avoids -4130 conflict)
         for attempt in range(retries):
             try:
-                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET at {tp_price:.2f} (attempt {attempt+1})...")
+                print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET at {tp_price:.2f} for {quantity} {SYMBOL} (attempt {attempt+1})...")
                 sys.stdout.flush()
                 tp = await self.client.futures_create_order(
                     symbol=SYMBOL,
                     side=close_side,
                     type='TAKE_PROFIT_MARKET',
                     stopPrice=round(tp_price, PRICE_PRECISION),
-                    closePosition='true',
+                    quantity=quantity,
                     newOrderRespType='RESULT',
                 )
                 order_id = tp.get('orderId')
@@ -415,18 +416,30 @@ class LiveORBSignals:
         return sl_success, tp_success
 
     async def market_close_position(self, side, reason="emergency"):
-        """Close position using closePosition=true. Safer than quantity-based close."""
+        """Close position using quantity (fetched from Binance)."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         try:
-            logger.info(f"Market close {side} position (reason: {reason})")
+            pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+            qty = 0.0
+            for p in pos_info:
+                amt = float(p['positionAmt'])
+                if amt != 0:
+                    qty = abs(amt)
+                    break
+            if qty <= 0:
+                print(f"ℹ️ No position to close (reason: {reason})")
+                sys.stdout.flush()
+                self.active_position = None
+                return True
+            logger.info(f"Market close {qty} {side} position (reason: {reason})")
             await self.client.futures_create_order(
                 symbol=SYMBOL,
                 side=close_side,
                 type='MARKET',
-                closePosition='true',
+                quantity=qty,
                 newOrderRespType='RESULT',
             )
-            print(f"✅ Position {side} closed via MARKET (reason: {reason})")
+            print(f"✅ Position {qty} {side} closed via MARKET (reason: {reason})")
             sys.stdout.flush()
             self.active_position = None
             return True
@@ -454,6 +467,10 @@ class LiveORBSignals:
     async def check_pending_limit_fill(self):
         if not self.pending_order_id:
             return False
+        now = time.time()
+        if now - getattr(self, '_last_fill_check', 0) < 10:
+            return False
+        self._last_fill_check = now
         try:
             order = await self.client.futures_get_order(symbol=SYMBOL, orderId=self.pending_order_id)
             status = order['status']
@@ -616,7 +633,7 @@ class LiveORBSignals:
                     side=close_side,
                     type='STOP_MARKET',
                     stopPrice=round(new_sl, PRICE_PRECISION),
-                    closePosition='true',
+                    quantity=current_qty,
                     newOrderRespType='RESULT',
                 )
                 order_id = new_sl_order.get('orderId')
@@ -1319,5 +1336,4 @@ if __name__ == "__main__":
             logger.info("Bot session ended")
         print("🔄 Restarting bot in 10 seconds...")
         sys.stdout.flush()
-        import time
         time.sleep(10)
