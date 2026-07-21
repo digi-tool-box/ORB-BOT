@@ -6,7 +6,7 @@ import time
 import logging
 import pandas as pd
 import pytz
-from datetime import datetime, time
+from datetime import datetime
 from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
 from keep_alive import keep_alive
