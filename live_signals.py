@@ -412,6 +412,11 @@ class LiveORBSignals:
                     print(f"⚠️ TP response missing orderId: {str(tp)[:200]}")
                     sys.stdout.flush()
                     break
+            except Exception as e:
+                print(f"❌ TP attempt {attempt+1} failed: {e}")
+                sys.stdout.flush()
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
 
         # If both SL and TP placed, return success
         if sl_success and tp_success:
