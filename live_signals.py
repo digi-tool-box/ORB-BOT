@@ -304,6 +304,7 @@ class LiveORBSignals:
         await self._cancel_all_close_orders(close_side)
 
         # Place SL with quantity (NOT closePosition — avoids -4130 conflict)
+        sl_error_msg = None
         for attempt in range(retries):
             try:
                 print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} for {quantity} {SYMBOL} (attempt {attempt+1})...")
@@ -317,11 +318,18 @@ class LiveORBSignals:
                     newOrderRespType='RESULT',
                 )
                 order_id = sl.get('orderId')
+                sl_code = sl.get('code')
                 if order_id is not None:
                     self.sl_order_id = order_id
                     print(f"✅ SL placed successfully! ID: {order_id}")
                     sys.stdout.flush()
                     sl_success = True
+                    break
+                elif sl_code is not None:
+                    sl_msg = sl.get('msg', f'code={sl_code}')
+                    print(f"❌ SL rejected by Binance: {sl_msg}")
+                    sys.stdout.flush()
+                    sl_error_msg = sl_msg
                     break
                 else:
                     print(f"⚠️ SL response missing orderId, checking open orders...")
@@ -334,7 +342,9 @@ class LiveORBSignals:
                         sys.stdout.flush()
                         sl_success = True
                         break
-                    await self._cancel_all_close_orders(close_side)
+                    print(f"⚠️ SL order not found in open orders. Full response: {str(sl)[:200]}")
+                    sys.stdout.flush()
+                    break
             except Exception as e:
                 error_str = str(e)
                 if "-4130" in error_str:
@@ -386,20 +396,22 @@ class LiveORBSignals:
                     newOrderRespType='RESULT',
                 )
                 order_id = tp.get('orderId')
+                tp_code = tp.get('code')
                 if order_id is not None:
                     self.tp_order_id = order_id
                     print(f"✅ TP placed successfully! ID: {order_id}")
                     sys.stdout.flush()
                     tp_success = True
                     break
-                else:
-                    print(f"⚠️ TP response missing orderId, retrying...")
+                elif tp_code is not None:
+                    tp_msg = tp.get('msg', f'code={tp_code}')
+                    print(f"❌ TP rejected by Binance: {tp_msg}")
                     sys.stdout.flush()
-            except Exception as e:
-                print(f"❌ TP attempt {attempt+1} failed: {e}")
-                sys.stdout.flush()
-                if attempt < retries - 1:
-                    await asyncio.sleep(2)
+                    break
+                else:
+                    print(f"⚠️ TP response missing orderId: {str(tp)[:200]}")
+                    sys.stdout.flush()
+                    break
 
         # If both SL and TP placed, return success
         if sl_success and tp_success:
@@ -431,7 +443,7 @@ class LiveORBSignals:
         return sl_success, tp_success
 
     async def market_close_position(self, side, reason="emergency"):
-        """Close position using quantity (fetched from Binance)."""
+        """Close position using quantity (fetched from Binance), with closePosition fallback."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         try:
             qty = await self._get_position_qty()
@@ -440,14 +452,32 @@ class LiveORBSignals:
                 sys.stdout.flush()
                 self.active_position = None
                 return True
+
             logger.info(f"Market close {qty} {side} position (reason: {reason})")
-            await self.client.futures_create_order(
-                symbol=SYMBOL,
-                side=close_side,
-                type='MARKET',
-                quantity=qty,
-                newOrderRespType='RESULT',
-            )
+            try:
+                await self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=close_side,
+                    type='MARKET',
+                    quantity=qty,
+                    newOrderRespType='RESULT',
+                )
+            except Exception as e:
+                error_str = str(e)
+                if "-2019" in error_str:
+                    print(f"⚠️ qty-based MARKET close failed (-2019), trying closePosition fallback...")
+                    sys.stdout.flush()
+                    await self._cancel_all_close_orders(close_side)
+                    await self.client.futures_create_order(
+                        symbol=SYMBOL,
+                        side=close_side,
+                        type='MARKET',
+                        closePosition='true',
+                        newOrderRespType='RESULT',
+                    )
+                else:
+                    raise
+
             print(f"✅ Position {qty} {side} closed via MARKET (reason: {reason})")
             sys.stdout.flush()
             self.active_position = None
