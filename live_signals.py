@@ -278,12 +278,27 @@ class LiveORBSignals:
             pass
         return None, None
 
+    async def _get_position_qty(self):
+        try:
+            pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+            for p in pos_info:
+                amt = float(p['positionAmt'])
+                if amt != 0:
+                    return abs(amt)
+        except Exception:
+            pass
+        return 0.0
+
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=5):
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         sl_success = False
         tp_success = False
         self.sl_order_id = None
         self.tp_order_id = None
+
+        live_qty = await self._get_position_qty()
+        if live_qty > 0:
+            quantity = live_qty
 
         # Cancel ALL close-side orders to prevent -4130 conflict
         await self._cancel_all_close_orders(close_side)
@@ -419,13 +434,7 @@ class LiveORBSignals:
         """Close position using quantity (fetched from Binance)."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
         try:
-            pos_info = await self.client.futures_position_information(symbol=SYMBOL)
-            qty = 0.0
-            for p in pos_info:
-                amt = float(p['positionAmt'])
-                if amt != 0:
-                    qty = abs(amt)
-                    break
+            qty = await self._get_position_qty()
             if qty <= 0:
                 print(f"ℹ️ No position to close (reason: {reason})")
                 sys.stdout.flush()
@@ -500,7 +509,10 @@ class LiveORBSignals:
                 print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
                 sys.stdout.flush()
                 await asyncio.sleep(1.5)
-                sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, qty)
+                live_qty = await self._get_position_qty()
+                if live_qty <= 0:
+                    live_qty = qty
+                sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, live_qty)
                 if not sl_placed and not tp_placed:
                     print("🚨 CRITICAL: Both SL and TP failed! Checking if position still open...")
                     sys.stdout.flush()
