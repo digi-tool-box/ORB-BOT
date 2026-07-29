@@ -248,7 +248,7 @@ class LiveORBSignals:
             return None
 
     async def _cancel_all_close_orders(self, close_side):
-        """Cancel ALL orders on the close side to avoid -4130 conflicts."""
+        """Cancel ALL orders on the close side to avoid -4130 conflicts (regular + algo)."""
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for order in open_orders:
@@ -262,12 +262,22 @@ class LiveORBSignals:
                     except Exception as cancel_err:
                         if "Unknown order sent" not in str(cancel_err):
                             print(f"⚠️ Could not cancel order {order['orderId']}: {cancel_err}")
+
+            # Also cancel algo/conditional orders (Testnet)
+            try:
+                algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
+                for o in algo_data.get('openOrders', []):
+                    if o.get('side') == close_side:
+                        await self._cancel_algo_order(o['algoId'])
+            except Exception:
+                pass
         except Exception as e:
             print(f"⚠️ Error cancelling existing orders: {e}")
         await asyncio.sleep(1)
 
     async def _find_existing_exit_order(self, close_side, order_type, stop_price=None):
-        """Find existing exit order on Binance. Returns (orderId, stopPrice) or (None, None)."""
+        """Find existing exit order on Binance (regular + algo/conditional)."""
+        # Check regular orders
         try:
             open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
             for o in open_orders:
@@ -276,7 +286,29 @@ class LiveORBSignals:
                         return o['orderId'], float(o.get('stopPrice', 0))
         except Exception:
             pass
+
+        # Check algo/conditional orders (Testnet returns algoId instead of orderId)
+        try:
+            algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
+            for o in algo_data.get('openOrders', []):
+                if o.get('orderType') == order_type:
+                    if stop_price is None or abs(float(o.get('stopPrice', 0)) - stop_price) < 0.01:
+                        return o['algoId'], float(o.get('stopPrice', 0))
+        except Exception:
+            pass
+
         return None, None
+
+    async def _cancel_algo_order(self, algo_id):
+        """Cancel a conditional/algo order on Binance Testnet."""
+        try:
+            await self.client._request_futures_api('delete', 'algo/order', True, data={'symbol': SYMBOL, 'algoId': algo_id})
+            return True
+        except Exception as e:
+            if "Unknown order sent" not in str(e):
+                print(f"⚠️ Could not cancel algo order {algo_id}: {e}")
+                sys.stdout.flush()
+            return False
 
     async def _get_position_qty(self):
         try:
@@ -318,10 +350,16 @@ class LiveORBSignals:
                     newOrderRespType='RESULT',
                 )
                 order_id = sl.get('orderId')
+                algo_id = sl.get('algoId')
                 sl_code = sl.get('code')
                 if order_id is not None:
                     self.sl_order_id = order_id
                     print(f"✅ SL placed successfully! ID: {order_id}")
+                    sl_success = True
+                    break
+                elif algo_id is not None:
+                    self.sl_order_id = algo_id
+                    print(f"✅ SL placed (algo)! ID: {algo_id}")
                     sys.stdout.flush()
                     sl_success = True
                     break
@@ -332,7 +370,7 @@ class LiveORBSignals:
                     sl_error_msg = sl_msg
                     break
                 else:
-                    print(f"⚠️ SL response missing orderId, checking open orders...")
+                    print(f"⚠️ SL response missing orderId/algoId, checking open orders...")
                     sys.stdout.flush()
                     await asyncio.sleep(1)
                     found_id, _ = await self._find_existing_exit_order(close_side, 'STOP_MARKET', stop_price)
@@ -396,10 +434,17 @@ class LiveORBSignals:
                     newOrderRespType='RESULT',
                 )
                 order_id = tp.get('orderId')
+                algo_id = tp.get('algoId')
                 tp_code = tp.get('code')
                 if order_id is not None:
                     self.tp_order_id = order_id
                     print(f"✅ TP placed successfully! ID: {order_id}")
+                    sys.stdout.flush()
+                    tp_success = True
+                    break
+                elif algo_id is not None:
+                    self.tp_order_id = algo_id
+                    print(f"✅ TP placed (algo)! ID: {algo_id}")
                     sys.stdout.flush()
                     tp_success = True
                     break
@@ -409,7 +454,7 @@ class LiveORBSignals:
                     sys.stdout.flush()
                     break
                 else:
-                    print(f"⚠️ TP response missing orderId: {str(tp)[:200]}")
+                    print(f"⚠️ TP response missing orderId/algoId: {str(tp)[:200]}")
                     sys.stdout.flush()
                     break
             except Exception as e:
@@ -504,7 +549,11 @@ class LiveORBSignals:
             print(f"✅ Order {order_id} cancelled successfully")
             sys.stdout.flush()
         except Exception as e:
-            if "Unknown order sent" not in str(e):
+            if "Unknown order sent" in str(e):
+                print(f"⚠️ Not a regular order, trying algo cancel for {order_id}...")
+                sys.stdout.flush()
+                await self._cancel_algo_order(order_id)
+            else:
                 print(f"⚠️ Cancel order error (may be filled): {e}")
                 sys.stdout.flush()
 
@@ -683,11 +732,11 @@ class LiveORBSignals:
                     quantity=current_qty,
                     newOrderRespType='RESULT',
                 )
-                order_id = new_sl_order.get('orderId')
+                order_id = new_sl_order.get('orderId') or new_sl_order.get('algoId')
                 if order_id is not None:
                     self.sl_order_id = order_id
                 else:
-                    print(f"⚠️ Breakeven SL response missing orderId")
+                    print(f"⚠️ Breakeven SL response missing orderId/algoId")
                     sys.stdout.flush()
                 print(f"✅ New SL at entry: {new_sl:.2f}")
                 sys.stdout.flush()
@@ -1036,12 +1085,11 @@ class LiveORBSignals:
                 tp_price = None
                 sl_order_id = None
                 tp_order_id = None
+                expected_exit_side = 'SELL' if side == 'BUY' else 'BUY'
 
                 for o in open_orders:
                     o_type = o['type']
                     o_side = o['side']
-                    expected_exit_side = 'SELL' if side == 'BUY' else 'BUY'
-
                     if o_side == expected_exit_side:
                         if o_type == 'STOP_MARKET':
                             sl_order_id = o['orderId']
@@ -1049,6 +1097,21 @@ class LiveORBSignals:
                         elif o_type == 'TAKE_PROFIT_MARKET':
                             tp_order_id = o['orderId']
                             tp_price = float(o['stopPrice'])
+
+                # Also check algo/conditional orders (Testnet)
+                if sl_order_id is None or tp_order_id is None:
+                    try:
+                        algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
+                        for o in algo_data.get('openOrders', []):
+                            if o.get('side') == expected_exit_side:
+                                if o.get('orderType') == 'STOP_MARKET' and sl_order_id is None:
+                                    sl_order_id = o['algoId']
+                                    sl_price = float(o['stopPrice'])
+                                elif o.get('orderType') == 'TAKE_PROFIT_MARKET' and tp_order_id is None:
+                                    tp_order_id = o['algoId']
+                                    tp_price = float(o['stopPrice'])
+                    except Exception:
+                        pass
 
                 print(f"   🛑 Sync SL: OrderID={sl_order_id}, Price={sl_price if sl_price else 'N/A'}")
                 print(f"   🎯 Sync TP: OrderID={tp_order_id}, Price={tp_price if tp_price else 'N/A'}")
