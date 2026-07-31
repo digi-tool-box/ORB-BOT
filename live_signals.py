@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 from keep_alive import keep_alive
 from telegram_notifier import send_telegram
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 load_dotenv()
 
 from config import (
@@ -263,10 +267,10 @@ class LiveORBSignals:
                         if "Unknown order sent" not in str(cancel_err):
                             print(f"⚠️ Could not cancel order {order['orderId']}: {cancel_err}")
 
-            # Also cancel algo/conditional orders (Testnet)
+            # Also cancel algo/conditional orders (Testnet returns algoId instead of orderId)
             try:
-                algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
-                for o in algo_data.get('openOrders', []):
+                algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+                for o in algo_orders:
                     if o.get('side') == close_side:
                         await self._cancel_algo_order(o['algoId'])
             except Exception:
@@ -289,11 +293,12 @@ class LiveORBSignals:
 
         # Check algo/conditional orders (Testnet returns algoId instead of orderId)
         try:
-            algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
-            for o in algo_data.get('openOrders', []):
+            algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+            for o in algo_orders:
                 if o.get('orderType') == order_type:
-                    if stop_price is None or abs(float(o.get('stopPrice', 0)) - stop_price) < 0.01:
-                        return o['algoId'], float(o.get('stopPrice', 0))
+                    o_price = float(o.get('triggerPrice', 0))
+                    if stop_price is None or abs(o_price - stop_price) < 0.01:
+                        return o['algoId'], o_price
         except Exception:
             pass
 
@@ -302,13 +307,53 @@ class LiveORBSignals:
     async def _cancel_algo_order(self, algo_id):
         """Cancel a conditional/algo order on Binance Testnet."""
         try:
-            await self.client._request_futures_api('delete', 'algo/order', True, data={'symbol': SYMBOL, 'algoId': algo_id})
+            await self.client._request_futures_api('delete', 'algoOrder', True, data={'algoId': algo_id})
             return True
         except Exception as e:
             if "Unknown order sent" not in str(e):
                 print(f"⚠️ Could not cancel algo order {algo_id}: {e}")
                 sys.stdout.flush()
             return False
+
+    async def _place_exit_order(self, side, order_type, trigger_price, quantity):
+        """Place a STOP_MARKET/TAKE_PROFIT_MARKET order. Returns (order_id, error_msg).
+
+        Tries the regular /fapi/v1/order endpoint first; on -4120 (order type moved to
+        Algo Order API) retries via POST /fapi/v1/algoOrder which returns algoId.
+        """
+        params = dict(
+            symbol=SYMBOL,
+            side=side,
+            type=order_type,
+            stopPrice=round(trigger_price, PRICE_PRECISION),
+            quantity=quantity,
+            newOrderRespType='RESULT',
+        )
+        try:
+            resp = await self.client.futures_create_order(**params)
+            order_id = resp.get('orderId')
+            if order_id is not None:
+                return order_id, None
+            return resp.get('algoId'), None
+        except Exception as e:
+            error_str = str(e)
+            if "-4120" not in error_str:
+                return None, error_str
+            print("ℹ️ Stop order type moved to Algo Order API, retrying via /fapi/v1/algoOrder...")
+            sys.stdout.flush()
+            try:
+                resp = await self.client._request_futures_api('post', 'algoOrder', True, data={
+                    'algoType': 'CONDITIONAL',
+                    'symbol': SYMBOL,
+                    'side': side,
+                    'type': order_type,
+                    'quantity': quantity,
+                    'triggerPrice': round(trigger_price, PRICE_PRECISION),
+                    'newOrderRespType': 'RESULT',
+                })
+                return resp.get('algoId'), None
+            except Exception as e2:
+                return None, str(e2)
 
     async def _get_position_qty(self):
         try:
@@ -341,33 +386,21 @@ class LiveORBSignals:
             try:
                 print(f"🛑 Placing SL {close_side} STOP_MARKET at {stop_price:.2f} for {quantity} {SYMBOL} (attempt {attempt+1})...")
                 sys.stdout.flush()
-                sl = await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=close_side,
-                    type='STOP_MARKET',
-                    stopPrice=round(stop_price, PRICE_PRECISION),
-                    quantity=quantity,
-                    newOrderRespType='RESULT',
-                )
-                order_id = sl.get('orderId')
-                algo_id = sl.get('algoId')
-                sl_code = sl.get('code')
+                order_id, sl_err = await self._place_exit_order(
+                    close_side, 'STOP_MARKET', stop_price, quantity)
                 if order_id is not None:
                     self.sl_order_id = order_id
                     print(f"✅ SL placed successfully! ID: {order_id}")
                     sl_success = True
                     break
-                elif algo_id is not None:
-                    self.sl_order_id = algo_id
-                    print(f"✅ SL placed (algo)! ID: {algo_id}")
+                elif sl_err and "code=-4130" in sl_err:
+                    print(f"❌ SL attempt {attempt+1} failed (-4130). Cancelling conflicting orders and retrying...")
                     sys.stdout.flush()
-                    sl_success = True
-                    break
-                elif sl_code is not None:
-                    sl_msg = sl.get('msg', f'code={sl_code}')
-                    print(f"❌ SL rejected by Binance: {sl_msg}")
+                    await self._cancel_all_close_orders(close_side)
+                elif sl_err:
+                    print(f"❌ SL rejected by Binance: {sl_err}")
                     sys.stdout.flush()
-                    sl_error_msg = sl_msg
+                    sl_error_msg = sl_err
                     break
                 else:
                     print(f"⚠️ SL response missing orderId/algoId, checking open orders...")
@@ -380,7 +413,7 @@ class LiveORBSignals:
                         sys.stdout.flush()
                         sl_success = True
                         break
-                    print(f"⚠️ SL order not found in open orders. Full response: {str(sl)[:200]}")
+                    print(f"⚠️ SL order not found in open orders.")
                     sys.stdout.flush()
                     break
             except Exception as e:
@@ -425,36 +458,20 @@ class LiveORBSignals:
             try:
                 print(f"🎯 Placing TP {close_side} TAKE_PROFIT_MARKET at {tp_price:.2f} for {quantity} {SYMBOL} (attempt {attempt+1})...")
                 sys.stdout.flush()
-                tp = await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=close_side,
-                    type='TAKE_PROFIT_MARKET',
-                    stopPrice=round(tp_price, PRICE_PRECISION),
-                    quantity=quantity,
-                    newOrderRespType='RESULT',
-                )
-                order_id = tp.get('orderId')
-                algo_id = tp.get('algoId')
-                tp_code = tp.get('code')
+                order_id, tp_err = await self._place_exit_order(
+                    close_side, 'TAKE_PROFIT_MARKET', tp_price, quantity)
                 if order_id is not None:
                     self.tp_order_id = order_id
                     print(f"✅ TP placed successfully! ID: {order_id}")
                     sys.stdout.flush()
                     tp_success = True
                     break
-                elif algo_id is not None:
-                    self.tp_order_id = algo_id
-                    print(f"✅ TP placed (algo)! ID: {algo_id}")
-                    sys.stdout.flush()
-                    tp_success = True
-                    break
-                elif tp_code is not None:
-                    tp_msg = tp.get('msg', f'code={tp_code}')
-                    print(f"❌ TP rejected by Binance: {tp_msg}")
+                elif tp_err:
+                    print(f"❌ TP rejected by Binance: {tp_err}")
                     sys.stdout.flush()
                     break
                 else:
-                    print(f"⚠️ TP response missing orderId/algoId: {str(tp)[:200]}")
+                    print(f"⚠️ TP response missing orderId/algoId")
                     sys.stdout.flush()
                     break
             except Exception as e:
@@ -724,22 +741,15 @@ class LiveORBSignals:
 
             close_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
-                new_sl_order = await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=close_side,
-                    type='STOP_MARKET',
-                    stopPrice=round(new_sl, PRICE_PRECISION),
-                    quantity=current_qty,
-                    newOrderRespType='RESULT',
-                )
-                order_id = new_sl_order.get('orderId') or new_sl_order.get('algoId')
+                order_id, be_err = await self._place_exit_order(
+                    close_side, 'STOP_MARKET', new_sl, current_qty)
                 if order_id is not None:
                     self.sl_order_id = order_id
-                else:
-                    print(f"⚠️ Breakeven SL response missing orderId/algoId")
+                    print(f"✅ New SL at entry: {new_sl:.2f} (ID: {order_id})")
                     sys.stdout.flush()
-                print(f"✅ New SL at entry: {new_sl:.2f}")
-                sys.stdout.flush()
+                else:
+                    print(f"⚠️ Breakeven SL failed: {be_err}")
+                    sys.stdout.flush()
             except Exception as e:
                 print(f"❌ Breakeven SL order error: {e}")
                 sys.stdout.flush()
@@ -1101,15 +1111,15 @@ class LiveORBSignals:
                 # Also check algo/conditional orders (Testnet)
                 if sl_order_id is None or tp_order_id is None:
                     try:
-                        algo_data = await self.client._request_futures_api('get', 'algo/open/orders', True, data={'symbol': SYMBOL})
-                        for o in algo_data.get('openOrders', []):
+                        algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+                        for o in algo_orders:
                             if o.get('side') == expected_exit_side:
                                 if o.get('orderType') == 'STOP_MARKET' and sl_order_id is None:
                                     sl_order_id = o['algoId']
-                                    sl_price = float(o['stopPrice'])
+                                    sl_price = float(o['triggerPrice'])
                                 elif o.get('orderType') == 'TAKE_PROFIT_MARKET' and tp_order_id is None:
                                     tp_order_id = o['algoId']
-                                    tp_price = float(o['stopPrice'])
+                                    tp_price = float(o['triggerPrice'])
                     except Exception:
                         pass
 
