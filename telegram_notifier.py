@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from html import escape
 
 try:
     import requests
@@ -19,7 +20,7 @@ def send_telegram(message, token=None, chat_id=None):
         return False
     try:
         url = TELEGRAM_API.format(token=token)
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        payload = {"chat_id": chat_id, "text": escape(message), "parse_mode": "HTML"}
         r = requests.post(url, data=payload, timeout=10)
         if r.status_code != 200:
             print(f"⚠️ Telegram send failed: {r.text[:100]}")
