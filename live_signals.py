@@ -721,9 +721,6 @@ class LiveORBSignals:
             print(f"🔄 Updating SL: {current_sl:.2f} → {new_sl:.2f}")
             sys.stdout.flush()
 
-            if self.sl_order_id:
-                await self.cancel_order(self.sl_order_id)
-
             try:
                 pos_info = await self.client.futures_position_information(symbol=SYMBOL)
                 current_qty = 0.0
@@ -733,11 +730,14 @@ class LiveORBSignals:
                         current_qty = abs(amt)
                         break
                 if current_qty <= 0:
-                    print("⚠️ No position size found, cannot update breakeven SL.")
+                    print("⚠️ No position size found, skipping SL update (position already closed).")
                     return
             except Exception as e:
                 print(f"❌ Failed to get position size: {e}")
                 return
+
+            if self.sl_order_id:
+                await self.cancel_order(self.sl_order_id)
 
             close_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
