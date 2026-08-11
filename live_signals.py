@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import sys
 import signal
 import time
@@ -67,6 +68,36 @@ class LiveORBSignals:
         self._shutdown_requested = False
         self.daily_pnl = 0.0
         self.max_daily_loss_pct = 20.0
+        self._rate_limited_until = 0.0
+        self._ban_logged_at = 0.0
+
+    def record_rate_limit(self, error):
+        """Detect Binance -1003 rate-limit (IP ban) and store when REST may resume."""
+        err = str(getattr(error, 'message', error))
+        if "-1003" not in err:
+            return False
+        resume_s = 0.0
+        match = re.search(r"banned until (\d+)", err)
+        if match:
+            resume_s = int(match.group(1)) / 1000.0
+        if resume_s <= time.time():
+            resume_s = time.time() + 60
+        self._rate_limited_until = max(self._rate_limited_until, resume_s)
+        now = time.time()
+        if now - self._ban_logged_at > 60:
+            self._ban_logged_at = now
+            print(f"⚠️ Binance rate-limit ban (-1003)! Pausing REST for ~{int(self._rate_limited_until - now)}s.")
+            sys.stdout.flush()
+        return True
+
+    def is_rate_limited(self):
+        """True while a -1003 ban is active (avoid REST calls)."""
+        return time.time() < self._rate_limited_until
+
+    async def await_rate_clear(self):
+        """Wait (async) until any active ban clears. WS loop unaffected."""
+        while self.is_rate_limited():
+            await asyncio.sleep(5)
 
     def notify(self, message):
         send_telegram(message, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID)
@@ -128,6 +159,7 @@ class LiveORBSignals:
         except Exception as e:
             print(f"⚠️ Balance fetch error: {e}")
             sys.stdout.flush()
+            self.record_rate_limit(e)
         return INITIAL_CAPITAL
 
     def calculate_quantity(self, entry, stop, side, balance):
@@ -222,6 +254,11 @@ class LiveORBSignals:
                         self.notify(f"❌ LIMIT entry failed | {side} {SYMBOL} @ {price:.2f}\n{error_str[:200]}")
                         return None
                 else:
+                    self.record_rate_limit(e)
+                    if self.is_rate_limited():
+                        print(f"❌ LIMIT entry skipped (rate-limited): {e}")
+                        sys.stdout.flush()
+                        return None
                     print(f"❌ LIMIT entry error: {e}")
                     sys.stdout.flush()
                     self.notify(f"❌ LIMIT entry failed | {side} {SYMBOL} @ {price:.2f}\n{str(e)[:200]}")
@@ -362,8 +399,8 @@ class LiveORBSignals:
                 amt = float(p['positionAmt'])
                 if amt != 0:
                     return abs(amt)
-        except Exception:
-            pass
+        except Exception as e:
+            self.record_rate_limit(e)
         return 0.0
 
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=5):
@@ -401,6 +438,7 @@ class LiveORBSignals:
                     print(f"❌ SL rejected by Binance: {sl_err}")
                     sys.stdout.flush()
                     sl_error_msg = sl_err
+                    self.record_rate_limit(sl_err)
                     break
                 else:
                     print(f"⚠️ SL response missing orderId/algoId, checking open orders...")
@@ -425,7 +463,12 @@ class LiveORBSignals:
                 else:
                     print(f"❌ SL attempt {attempt+1} failed: {e}")
                     sys.stdout.flush()
-                if not sl_success and attempt < retries - 1:
+                    self.record_rate_limit(e)
+                    if self.is_rate_limited():
+                        print("⛔ SL placement skipped (rate-limited), keeping existing orders...")
+                        sys.stdout.flush()
+                        break
+                if not sl_success and attempt < retries - 1 and not self.is_rate_limited():
                     await asyncio.sleep(2)
 
         # Check current mark price before placing TP
@@ -552,6 +595,7 @@ class LiveORBSignals:
         except Exception as e:
             print(f"❌ Market close failed (reason: {reason}): {e}")
             logger.error(f"Market close failed: {e}")
+            self.record_rate_limit(e)
             sys.stdout.flush()
             self.notify(f"❌ Market close failed | {reason}\n{str(e)[:200]}")
             return False
@@ -576,6 +620,8 @@ class LiveORBSignals:
 
     async def check_pending_limit_fill(self):
         if not self.pending_order_id:
+            return False
+        if self.is_rate_limited():
             return False
         now = time.time()
         if now - getattr(self, '_last_fill_check', 0) < 10:
@@ -661,10 +707,13 @@ class LiveORBSignals:
         except Exception as e:
             print(f"⚠️ Error checking pending limit fill: {e}")
             sys.stdout.flush()
+            self.record_rate_limit(e)
             return False
 
     async def update_trailing_stop(self, candle_high, candle_low, candle_close):
         if not self.active_position:
+            return
+        if self.is_rate_limited():
             return
 
         pos = self.active_position
@@ -734,6 +783,7 @@ class LiveORBSignals:
                     return
             except Exception as e:
                 print(f"❌ Failed to get position size: {e}")
+                self.record_rate_limit(e)
                 return
 
             if self.sl_order_id:
@@ -761,6 +811,8 @@ class LiveORBSignals:
 
     async def check_position_status(self):
         if not self.active_position:
+            return False
+        if self.is_rate_limited():
             return False
 
         try:
@@ -818,10 +870,13 @@ class LiveORBSignals:
         except Exception as e:
             print(f"⚠️ Position check error: {e}")
             sys.stdout.flush()
+            self.record_rate_limit(e)
 
         return False
 
     async def process_closed_candle(self, kline, stream=None):
+        if self.is_rate_limited():
+            return
         try:
             candle_open_ts = kline['t']
             utc_time = datetime.fromtimestamp(candle_open_ts / 1000, tz=pytz.utc)
