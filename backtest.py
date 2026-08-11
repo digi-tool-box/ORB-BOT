@@ -62,65 +62,105 @@ def simulate_trades(df, signals, capital, risk_pct):
     trailing_pct = TRAIL_STEP_PCT
 
     for _, sig in signals.iterrows():
-        entry = sig['entry']
-        slippage = SLIPPAGE_PCT / 100
-        
-        # --- FIXED: Indentation theek kar di gayi hai aur 'entry' ko hi update kiya gaya hai ---
-        if sig['type'] == 'BUY':
-            entry = entry * (1 + slippage)   # buy mein thoda upar
-        else:
-            entry = entry * (1 - slippage)   # sell mein thoda neeche
-            
-        current_sl = sig['stop']  # Dynamic SL
-        target = sig['target']
-        
-        risk_per_unit = abs(entry - current_sl)
-        risk_amount = equity * (risk_pct / 100)
-        max_position_value = equity * LEVERAGE
-        qty_risk = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        qty_margin = max_position_value / entry if entry > 0 else float('inf')
-        qty = min(qty_risk, qty_margin)
-        entry_time = sig['entry_time']
-        
-        post_entry = df[df.index >= entry_time]
-        
-        # Trailing tracking variables
-        is_breakeven_hit = False
-        highest_high = entry
-        lowest_low = entry
+            entry = sig['entry']
+            entry_time = sig['entry_time']
+            base_stop = sig['stop']
+            target = sig['target']
 
-        for idx, candle in post_entry.iterrows():
-            if sig['type'] == 'BUY':
-                # --- TRAILING & BREAKEVEN LOGIC FOR BUY ---
-                if candle['high'] > highest_high:
-                    highest_high = candle['high']
+            side = sig['type']
+            # Entry LIMIT price hi level hai; kho jao toh pura move karo
+            if side == 'BUY':
+                slippage_factor = (1 + SLIPPAGE_PCT / 100)
+            else:
+                slippage_factor = (1 - SLIPPAGE_PCT / 100)
 
-                # Check for Breakeven Trigger
-                profit_pct = (highest_high - entry) / entry
-                if profit_pct >= breakeven_trigger_pct and not is_breakeven_hit:
-                    current_sl = entry
-                    is_breakeven_hit = True
+            risk_per_unit = abs(entry - base_stop)
+            risk_amount = equity * (risk_pct / 100)
+            max_position_value = equity * LEVERAGE
+            qty_risk = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+            qty_margin = max_position_value / entry if entry > 0 else float('inf')
+            qty = min(qty_risk, qty_margin)
+            if qty <= 0:
+                continue
 
-                # If Breakeven is hit, trail SL 0.1% behind highest high
-                if is_breakeven_hit:
-                    new_trail_sl = highest_high * (1 - trailing_pct)
-                    if new_trail_sl > current_sl:
-                        current_sl = new_trail_sl
+            current_sl = base_stop
+            filled = False
+            highest_high = entry
+            lowest_low = entry
+            is_breakeven_hit = False
+            entry_price = None
+            exit_price = None
+            outcome = None
+            exit_time = None
 
-                # --- EXIT CONDITIONS ---
-                if candle['low'] <= current_sl:
-                    exit_price = current_sl
-                    pnl = (exit_price - entry) * qty
-                    maker_fee = entry * qty * (MAKER_FEE / 100)
+            post_entry = df[df.index >= entry_time]
+
+            for idx, candle in post_entry.iterrows():
+                # REALISTIC ENTRY: limit sirf tab fill hoti hai jab price entry level touch kare
+                if not filled:
+                    if side == 'BUY':
+                        fills_here = (candle['low'] <= entry * slippage_factor)
+                    else:
+                        fills_here = (candle['high'] >= entry * slippage_factor)
+                    if fills_here:
+                        filled = True
+                        entry_price = entry * slippage_factor
+                        highest_high = max(highest_high, candle['high'])
+                        lowest_low = min(lowest_low, candle['low'])
+                    else:
+                        continue
+
+                if side == 'BUY':
+                    if candle['high'] > highest_high:
+                        highest_high = candle['high']
+                    profit_pct = (highest_high - entry_price) / entry_price
+                    if profit_pct >= breakeven_trigger_pct and not is_breakeven_hit:
+                        current_sl = entry_price
+                        is_breakeven_hit = True
+                    if is_breakeven_hit:
+                        new_trail_sl = highest_high * (1 - trailing_pct)
+                        if new_trail_sl > current_sl:
+                            current_sl = new_trail_sl
+                    # SL ko pehle check karte hain (conservative intrabar ordering)
+                    if candle['low'] <= current_sl:
+                        exit_price = current_sl
+                        outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
+                    elif candle['high'] >= target:
+                        exit_price = target
+                        outcome = 'TP'
+                else:  # SELL
+                    if candle['low'] < lowest_low:
+                        lowest_low = candle['low']
+                    profit_pct = (entry_price - lowest_low) / entry_price
+                    if profit_pct >= breakeven_trigger_pct and not is_breakeven_hit:
+                        current_sl = entry_price
+                        is_breakeven_hit = True
+                    if is_breakeven_hit:
+                        new_trail_sl = lowest_low * (1 + trailing_pct)
+                        if new_trail_sl < current_sl:
+                            current_sl = new_trail_sl
+                    if candle['high'] >= current_sl:
+                        exit_price = current_sl
+                        outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
+                    elif candle['low'] <= target:
+                        exit_price = target
+                        outcome = 'TP'
+
+                if outcome:
+                    exit_time = idx
+                    if side == 'BUY':
+                        pnl = (exit_price - entry_price) * qty
+                    else:
+                        pnl = (entry_price - exit_price) * qty
+                    maker_fee = entry_price * qty * (MAKER_FEE / 100)
                     taker_fee = exit_price * qty * (TAKER_FEE / 100)
                     total_fees = maker_fee + taker_fee
                     pnl -= total_fees
-                    outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
                     trades.append({
                         'entry_time': entry_time,
-                        'exit_time': idx,
-                        'type': 'BUY',
-                        'entry': entry,
+                        'exit_time': exit_time,
+                        'type': side,
+                        'entry': entry_price,
                         'exit': exit_price,
                         'pnl': pnl,
                         'fees': round(total_fees, 2),
@@ -129,89 +169,11 @@ def simulate_trades(df, signals, capital, risk_pct):
                     })
                     equity += pnl
                     break
-                    
-                if candle['high'] >= target:
-                    exit_price = target
-                    pnl = (exit_price - entry) * qty
-                    maker_fee = entry * qty * (MAKER_FEE / 100)
-                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
-                    total_fees = maker_fee + taker_fee
-                    pnl -= total_fees
-                    trades.append({
-                        'entry_time': entry_time,
-                        'exit_time': idx,
-                        'type': 'BUY',
-                        'entry': entry,
-                        'exit': exit_price,
-                        'pnl': pnl,
-                        'fees': round(total_fees, 2),
-                        'outcome': 'TP',
-                        'qty': qty
-                    })
-                    equity += pnl
-                    break
 
-            else:  # SELL SIGNALS
-                # --- TRAILING & BREAKEVEN LOGIC FOR SELL ---
-                if candle['low'] < lowest_low:
-                    lowest_low = candle['low']
+            if not filled:
+                # Limit order kabhi fill nahi hua (price retest par level touch nahi kiya)
+                pass
 
-                # Check for Breakeven Trigger
-                profit_pct = (entry - lowest_low) / entry
-                if profit_pct >= breakeven_trigger_pct and not is_breakeven_hit:
-                    current_sl = entry
-                    is_breakeven_hit = True
-
-                # If Breakeven is hit, trail SL 0.1% above lowest low
-                if is_breakeven_hit:
-                    new_trail_sl = lowest_low * (1 + trailing_pct)
-                    if new_trail_sl < current_sl:
-                        current_sl = new_trail_sl
-
-                # --- EXIT CONDITIONS ---
-                if candle['high'] >= current_sl:
-                    exit_price = current_sl
-                    pnl = (entry - exit_price) * qty
-                    maker_fee = entry * qty * (MAKER_FEE / 100)
-                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
-                    total_fees = maker_fee + taker_fee
-                    pnl -= total_fees
-                    outcome = 'Breakeven/TSL' if is_breakeven_hit else 'SL'
-                    trades.append({
-                        'entry_time': entry_time,
-                        'exit_time': idx,
-                        'type': 'SELL',
-                        'entry': entry,
-                        'exit': exit_price,
-                        'pnl': pnl,
-                        'fees': round(total_fees, 2),
-                        'outcome': outcome,
-                        'qty': qty
-                    })
-                    equity += pnl
-                    break
-                    
-                if candle['low'] <= target:
-                    exit_price = target
-                    pnl = (entry - exit_price) * qty
-                    maker_fee = entry * qty * (MAKER_FEE / 100)
-                    taker_fee = exit_price * qty * (TAKER_FEE / 100)
-                    total_fees = maker_fee + taker_fee
-                    pnl -= total_fees
-                    trades.append({
-                        'entry_time': entry_time,
-                        'exit_time': idx,
-                        'type': 'SELL',
-                        'entry': entry,
-                        'exit': exit_price,
-                        'pnl': pnl,
-                        'fees': round(total_fees, 2),
-                        'outcome': 'TP',
-                        'qty': qty
-                    })
-                    equity += pnl
-                    break
-                    
     return pd.DataFrame(trades)
 
 if __name__ == "__main__":
