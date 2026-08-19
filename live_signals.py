@@ -5,6 +5,7 @@ import sys
 import signal
 import time
 import logging
+import random
 import pandas as pd
 import pytz
 from datetime import datetime
@@ -25,7 +26,8 @@ from config import (
     BREAKOUT_PCT, RETEST_ZONE_PCT, RISK_REWARD, SL_BUFFER_PCT,
     BREAKEVEN_TRIGGER, TRAIL_STEP_PCT, MAKER_FEE, TAKER_FEE,
     MAX_TRADES_PER_DAY, DEBUG_MODE, QUANTITY_PRECISION, PRICE_PRECISION,
-    LOG_FILE, IS_TESTNET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    LOG_FILE, IS_TESTNET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    FILL_CHECK_INTERVAL_SECONDS, FILL_CHECK_JITTER_SECONDS
 )
 
 API_KEY = os.environ.get('API_KEY')
@@ -70,6 +72,7 @@ class LiveORBSignals:
         self.max_daily_loss_pct = 20.0
         self._rate_limited_until = 0.0
         self._ban_logged_at = 0.0
+        self._need_resync_on_ban_clear = False
 
     def record_rate_limit(self, error):
         """Detect Binance -1003 rate-limit (IP ban) and store when REST may resume."""
@@ -83,6 +86,7 @@ class LiveORBSignals:
         if resume_s <= time.time():
             resume_s = time.time() + 60
         self._rate_limited_until = max(self._rate_limited_until, resume_s)
+        self._need_resync_on_ban_clear = True
         now = time.time()
         if now - self._ban_logged_at > 60:
             self._ban_logged_at = now
@@ -624,7 +628,8 @@ class LiveORBSignals:
         if self.is_rate_limited():
             return False
         now = time.time()
-        if now - getattr(self, '_last_fill_check', 0) < 10:
+        interval = FILL_CHECK_INTERVAL_SECONDS + random.uniform(0, FILL_CHECK_JITTER_SECONDS)
+        if now - getattr(self, '_last_fill_check', 0) < interval:
             return False
         self._last_fill_check = now
         try:
@@ -1187,12 +1192,14 @@ class LiveORBSignals:
                     print("🚨 Recovered position has incomplete SL/TP! Closing immediately to prevent loss.")
                     sys.stdout.flush()
                     self.notify(f"🚨 Recovered {side} position with incomplete SL/TP\nClosing to prevent loss")
+                    self.pending_order_id = None
                     await self.market_close_position(side, reason="Recovered with incomplete SL/TP")
                     return
 
                 # Only if both orders exist, restore active_position
                 self.sl_order_id = sl_order_id
                 self.tp_order_id = tp_order_id
+                self.pending_order_id = None
                 self.active_position = {
                     'side': side,
                     'entry': entry_price,
@@ -1397,6 +1404,13 @@ class LiveORBSignals:
                                 if last_msg_count == 1:
                                     print(f"📨 First WebSocket message received! Type: {msg.get('e', 'unknown')}")
                                     sys.stdout.flush()
+
+                                if self._need_resync_on_ban_clear and not self.is_rate_limited():
+                                    self._need_resync_on_ban_clear = False
+                                    print("🔁 Rate-limit ban cleared! Re-syncing position & orders...")
+                                    sys.stdout.flush()
+                                    await self.recover_active_position()
+                                    await self.recover_pending_orders()
 
                                 if msg['e'] in ['kline', 'continuous_kline']:
                                     kline = msg['k']

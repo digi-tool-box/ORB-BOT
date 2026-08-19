@@ -54,6 +54,12 @@ TRAIL_STEP_PCT = 0.001      # Trailing step 0.1%
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # @BotFather se lo
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # @userinfobot se lo
 
+# === RATE-LIMIT SAFETY ===
+# Shared-IP hosts (Render) trigger Binance -1003 bans from neighbors. Keep REST
+# light and desynchronized so our own polls don't collide/extend bans.
+FILL_CHECK_INTERVAL_SECONDS = 30    # min seconds between pending-order REST checks
+FILL_CHECK_JITTER_SECONDS = 5       # +random jitter to avoid syncing with neighbors
+
 # === DEBUG & LOGGING ===
 DEBUG_MODE = True           # set False to silence debug prints
 MAX_TRADES_PER_DAY = 2      # maximum number of trades allowed per day
