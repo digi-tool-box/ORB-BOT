@@ -397,14 +397,11 @@ class LiveORBSignals:
                 return None, str(e2)
 
     async def _get_position_qty(self):
-        try:
-            pos_info = await self.client.futures_position_information(symbol=SYMBOL)
-            for p in pos_info:
-                amt = float(p['positionAmt'])
-                if amt != 0:
-                    return abs(amt)
-        except Exception as e:
-            self.record_rate_limit(e)
+        pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+        for p in pos_info:
+            amt = float(p['positionAmt'])
+            if amt != 0:
+                return abs(amt)
         return 0.0
 
     async def place_exit_orders(self, side, stop_price, tp_price, quantity, retries=5):
@@ -556,53 +553,75 @@ class LiveORBSignals:
 
         return sl_success, tp_success
 
-    async def market_close_position(self, side, reason="emergency"):
-        """Close position using quantity (fetched from Binance), with closePosition fallback."""
+    async def market_close_position(self, side, reason="emergency", max_retries=3):
+        """Close position with verification and retry. Returns True only if position is confirmed closed."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
-        try:
-            qty = await self._get_position_qty()
-            if qty <= 0:
-                print(f"ℹ️ No position to close (reason: {reason})")
-                sys.stdout.flush()
-                self.active_position = None
-                return True
 
-            logger.info(f"Market close {qty} {side} position (reason: {reason})")
+        for attempt in range(1, max_retries + 1):
             try:
-                await self.client.futures_create_order(
-                    symbol=SYMBOL,
-                    side=close_side,
-                    type='MARKET',
-                    quantity=qty,
-                    newOrderRespType='RESULT',
-                )
-            except Exception as e:
-                error_str = str(e)
-                if "-2019" in error_str:
-                    print(f"⚠️ qty-based MARKET close failed (-2019), trying closePosition fallback...")
-                    sys.stdout.flush()
-                    await self._cancel_all_close_orders(close_side)
+                qty = await self._get_position_qty()
+                if qty <= 0:
+                    if self.active_position:
+                        print(f"⚠️ Binance shows no position but active_position set — clearing (reason: {reason})")
+                        sys.stdout.flush()
+                        self.active_position = None
+                    else:
+                        print(f"ℹ️ No position to close (reason: {reason})")
+                        sys.stdout.flush()
+                    return True
+
+                logger.info(f"Market close {qty} {side} position (reason: {reason}, attempt {attempt}/{max_retries})")
+                try:
                     await self.client.futures_create_order(
                         symbol=SYMBOL,
                         side=close_side,
                         type='MARKET',
-                        closePosition='true',
+                        quantity=qty,
                         newOrderRespType='RESULT',
                     )
-                else:
-                    raise
+                except Exception as e:
+                    error_str = str(e)
+                    if "-2019" in error_str:
+                        print(f"⚠️ qty-based MARKET close failed (-2019), trying closePosition fallback...")
+                        sys.stdout.flush()
+                        await self._cancel_all_close_orders(close_side)
+                        await self.client.futures_create_order(
+                            symbol=SYMBOL,
+                            side=close_side,
+                            type='MARKET',
+                            closePosition='true',
+                            newOrderRespType='RESULT',
+                        )
+                    else:
+                        raise
 
-            print(f"✅ Position {qty} {side} closed via MARKET (reason: {reason})")
-            sys.stdout.flush()
-            self.active_position = None
-            return True
-        except Exception as e:
-            print(f"❌ Market close failed (reason: {reason}): {e}")
-            logger.error(f"Market close failed: {e}")
-            self.record_rate_limit(e)
-            sys.stdout.flush()
-            self.notify(f"❌ Market close failed | {reason}\n{str(e)[:200]}")
-            return False
+                await asyncio.sleep(2)
+
+                verified_qty = await self._get_position_qty()
+                if verified_qty <= 0:
+                    print(f"✅ Position {qty} {side} CLOSED & VERIFIED (reason: {reason})")
+                    sys.stdout.flush()
+                    self.active_position = None
+                    self.notify(f"✅ Position closed | {qty} {side} | {reason}")
+                    return True
+                else:
+                    print(f"⚠️ Close order sent but position still {verified_qty} (attempt {attempt}/{max_retries})")
+                    sys.stdout.flush()
+                    if attempt < max_retries:
+                        await asyncio.sleep(2)
+
+            except Exception as e:
+                print(f"❌ Market close attempt {attempt} failed (reason: {reason}): {e}")
+                logger.error(f"Market close attempt {attempt} failed: {e}")
+                self.record_rate_limit(e)
+                sys.stdout.flush()
+                if attempt < max_retries:
+                    await asyncio.sleep(2)
+
+        print(f"❌ Market close FAILED after {max_retries} attempts (reason: {reason})")
+        sys.stdout.flush()
+        self.notify(f"❌ Market close FAILED after {max_retries} attempts | {reason}")
+        return False
 
     async def cancel_order(self, order_id):
         if not order_id:
@@ -926,7 +945,10 @@ class LiveORBSignals:
                 if self.active_position:
                     print("🕟 End of NY session – closing any open position.")
                     sys.stdout.flush()
-                    await self.market_close_position(self.active_position['side'], reason="End of NY session")
+                    closed = await self.market_close_position(self.active_position['side'], reason="End of NY session")
+                    if not closed:
+                        print("⚠️ EOD close failed — will retry on next candle")
+                        sys.stdout.flush()
                 return
 
             if self.active_position:
