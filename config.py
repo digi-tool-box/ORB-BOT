@@ -47,7 +47,7 @@ TP1_PCT = 0.5               # 0.5% profit pe 50% position exit (1:1)
 TP2_PCT = 1.0               # 1.0% profit pe remaining position exit (1:2)
 
 # Risk Protection
-BREAKEVEN_TRIGGER = 0.005   # Profit 0.5% reach hote hi SL ko entry pe shift karo
+BREAKEVEN_TRIGGER = 0.003   # Profit 0.3% reach hote hi SL ko entry pe shift karo
 TRAIL_STEP_PCT = 0.001      # Trailing step 0.1%
 
 # === TELEGRAM NOTIFICATIONS ===
