@@ -48,7 +48,7 @@ TP2_PCT = 1.0               # 1.0% profit pe remaining position exit (1:2)
 
 # Risk Protection
 BREAKEVEN_TRIGGER = 0.003   # Profit 0.3% reach hote hi SL ko entry pe shift karo
-TRAIL_STEP_PCT = 0.001      # Trailing step 0.1%
+TRAIL_STEP_PCT = 0.002      # Trailing step 0.2%
 
 # === TELEGRAM NOTIFICATIONS ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # @BotFather se lo

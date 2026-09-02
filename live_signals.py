@@ -797,10 +797,12 @@ class LiveORBSignals:
             try:
                 pos_info = await self.client.futures_position_information(symbol=SYMBOL)
                 current_qty = 0.0
+                current_mark = 0.0
                 for p in pos_info:
                     amt = float(p['positionAmt'])
                     if amt != 0:
                         current_qty = abs(amt)
+                        current_mark = float(p['markPrice'])
                         break
                 if current_qty <= 0:
                     print("⚠️ No position size found, skipping SL update (position already closed).")
@@ -808,6 +810,17 @@ class LiveORBSignals:
             except Exception as e:
                 print(f"❌ Failed to get position size: {e}")
                 self.record_rate_limit(e)
+                return
+
+            if side == 'BUY' and new_sl >= current_mark:
+                print(f"⚠️ New SL ({new_sl:.2f}) >= mark price ({current_mark:.2f}) — would trigger immediately. Closing position.")
+                sys.stdout.flush()
+                await self.market_close_position(side, reason="Trailing SL would trigger immediately")
+                return
+            elif side == 'SELL' and new_sl <= current_mark:
+                print(f"⚠️ New SL ({new_sl:.2f}) <= mark price ({current_mark:.2f}) — would trigger immediately. Closing position.")
+                sys.stdout.flush()
+                await self.market_close_position(side, reason="Trailing SL would trigger immediately")
                 return
 
             if self.sl_order_id:
