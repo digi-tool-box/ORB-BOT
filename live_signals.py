@@ -524,9 +524,35 @@ class LiveORBSignals:
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
 
-        # If both SL and TP placed, return success
+        # If both SL and TP placed, verify they exist on Binance
         if sl_success and tp_success:
             logger.info(f"SL/TP placed for {side} @ entry: {stop_price=}, {tp_price=}")
+            await asyncio.sleep(2)
+            try:
+                open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+                has_sl = any(o['type'] == 'STOP_MARKET' for o in open_orders)
+                has_tp = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in open_orders)
+                if not has_sl or not has_tp:
+                    try:
+                        algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+                        has_sl = has_sl or any(o.get('orderType') == 'STOP_MARKET' for o in algo_orders)
+                        has_tp = has_tp or any(o.get('orderType') == 'TAKE_PROFIT_MARKET' for o in algo_orders)
+                    except Exception:
+                        pass
+                if not has_sl or not has_tp:
+                    print(f"🚨 SL/TP verification FAILED! SL={'found' if has_sl else 'MISSING'}, TP={'found' if has_tp else 'MISSING'}")
+                    sys.stdout.flush()
+                    self.notify(f"🚨 SL/TP verification failed after placement\nClosing position immediately")
+                    pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                    pos_open = any(float(p['positionAmt']) != 0 for p in pos_info)
+                    if pos_open:
+                        await self.market_close_position(side, reason="SL/TP verification failed")
+                    return False, False
+                print(f"✅ SL/TP verified on Binance")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"⚠️ SL/TP verification error: {e} (continuing anyway)")
+                sys.stdout.flush()
             return sl_success, tp_success
 
         # Emergency MARKET exit if either SL or TP failed
@@ -965,6 +991,26 @@ class LiveORBSignals:
                 return
 
             if self.active_position:
+                try:
+                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+                    has_sl = any(o['type'] == 'STOP_MARKET' for o in open_orders)
+                    has_tp = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in open_orders)
+                    if not has_sl or not has_tp:
+                        try:
+                            algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+                            has_sl = has_sl or any(o.get('orderType') == 'STOP_MARKET' for o in algo_orders)
+                            has_tp = has_tp or any(o.get('orderType') == 'TAKE_PROFIT_MARKET' for o in algo_orders)
+                        except Exception:
+                            pass
+                    if not has_sl or not has_tp:
+                        print(f"🚨 Position has NO SL/TP protection! Closing immediately.")
+                        sys.stdout.flush()
+                        self.notify(f"🚨 Position unprotected (SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'})\nClosing immediately")
+                        await self.market_close_position(self.active_position['side'], reason="Position unprotected - no SL/TP")
+                        return
+                except Exception as e:
+                    print(f"⚠️ SL/TP check error: {e}")
+                    sys.stdout.flush()
                 await self.update_trailing_stop(high_price, low_price, close_price)
                 await self.check_position_status()
                 return
