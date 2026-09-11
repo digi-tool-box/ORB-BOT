@@ -411,10 +411,6 @@ class LiveORBSignals:
         self.sl_order_id = None
         self.tp_order_id = None
 
-        live_qty = await self._get_position_qty()
-        if live_qty > 0:
-            quantity = live_qty
-
         # Cancel ALL close-side orders to prevent -4130 conflict
         await self._cancel_all_close_orders(close_side)
 
@@ -708,6 +704,10 @@ class LiveORBSignals:
                 await asyncio.sleep(1.5)
                 live_qty = await self._get_position_qty()
                 if live_qty <= 0:
+                    live_qty = qty
+                elif abs(live_qty - qty) > qty * 0.1:
+                    print(f"⚠️ Position qty ({live_qty}) differs from fill qty ({qty}) — using fill qty")
+                    sys.stdout.flush()
                     live_qty = qty
                 sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, live_qty)
                 if not sl_placed and not tp_placed:
@@ -1060,7 +1060,7 @@ class LiveORBSignals:
             candle_range_pct = ((high - low) / low) * 100
 
             # BUY BREAKOUT → place LIMIT order within retest zone above OR High
-            if close > self.or_high and not self.breakout_done['BUY'] and not self.pending_order_id:
+            if close > self.or_high and not self.breakout_done['BUY'] and not self.pending_order_id and not self.active_position:
                 if candle_range_pct >= BREAKOUT_PCT:
                     print(f"📈 Breakout BUY Detected! Candle closed above OR High ({self.or_high:.2f}). Placing LIMIT BUY within retest zone...")
                     sys.stdout.flush()
@@ -1075,7 +1075,7 @@ class LiveORBSignals:
                     return
 
             # SELL BREAKOUT → place LIMIT order within retest zone below OR Low
-            if close < self.or_low and not self.breakout_done['SELL'] and not self.pending_order_id:
+            if close < self.or_low and not self.breakout_done['SELL'] and not self.pending_order_id and not self.active_position:
                 if candle_range_pct >= BREAKOUT_PCT:
                     print(f"📉 Breakout SELL Detected! Candle closed below OR Low ({self.or_low:.2f}). Placing LIMIT SELL within retest zone...")
                     sys.stdout.flush()
