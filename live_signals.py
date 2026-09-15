@@ -548,6 +548,7 @@ class LiveORBSignals:
                 sys.stdout.flush()
             except Exception as e:
                 print(f"⚠️ SL/TP verification error: {e} (continuing anyway)")
+                self.record_rate_limit(e)
                 sys.stdout.flush()
             return sl_success, tp_success
 
@@ -575,13 +576,28 @@ class LiveORBSignals:
 
         return sl_success, tp_success
 
-    async def market_close_position(self, side, reason="emergency", max_retries=3):
+    async def market_close_position(self, side, reason="emergency", max_retries=5):
         """Close position with verification and retry. Returns True only if position is confirmed closed."""
         close_side = 'SELL' if side == 'BUY' else 'BUY'
 
         for attempt in range(1, max_retries + 1):
             try:
-                qty = await self._get_position_qty()
+                if self.is_rate_limited():
+                    wait = min(30 * attempt, 120)
+                    print(f"⏸️ Rate limited — waiting {wait}s before close attempt {attempt}/{max_retries}")
+                    sys.stdout.flush()
+                    await asyncio.sleep(wait)
+
+                try:
+                    qty = await self._get_position_qty()
+                except Exception as e:
+                    print(f"⚠️ Cannot get position qty (attempt {attempt}/{max_retries}): {e}")
+                    self.record_rate_limit(e)
+                    sys.stdout.flush()
+                    if attempt < max_retries:
+                        await asyncio.sleep(5 * attempt)
+                    continue
+
                 if qty <= 0:
                     if self.active_position:
                         print(f"⚠️ Binance shows no position but active_position set — clearing (reason: {reason})")
@@ -593,33 +609,25 @@ class LiveORBSignals:
                     return True
 
                 logger.info(f"Market close {qty} {side} position (reason: {reason}, attempt {attempt}/{max_retries})")
+                await self.client.futures_create_order(
+                    symbol=SYMBOL,
+                    side=close_side,
+                    type='MARKET',
+                    quantity=qty,
+                    reduceOnly='true',
+                    newOrderRespType='RESULT',
+                )
+
+                await asyncio.sleep(3)
+
                 try:
-                    await self.client.futures_create_order(
-                        symbol=SYMBOL,
-                        side=close_side,
-                        type='MARKET',
-                        quantity=qty,
-                        newOrderRespType='RESULT',
-                    )
+                    verified_qty = await self._get_position_qty()
                 except Exception as e:
-                    error_str = str(e)
-                    if "-2019" in error_str:
-                        print(f"⚠️ qty-based MARKET close failed (-2019), trying closePosition fallback...")
-                        sys.stdout.flush()
-                        await self._cancel_all_close_orders(close_side)
-                        await self.client.futures_create_order(
-                            symbol=SYMBOL,
-                            side=close_side,
-                            type='MARKET',
-                            closePosition='true',
-                            newOrderRespType='RESULT',
-                        )
-                    else:
-                        raise
+                    print(f"⚠️ Cannot verify close (attempt {attempt}/{max_retries}): {e}")
+                    self.record_rate_limit(e)
+                    sys.stdout.flush()
+                    verified_qty = qty
 
-                await asyncio.sleep(2)
-
-                verified_qty = await self._get_position_qty()
                 if verified_qty <= 0:
                     print(f"✅ Position {qty} {side} CLOSED & VERIFIED (reason: {reason})")
                     sys.stdout.flush()
@@ -630,7 +638,7 @@ class LiveORBSignals:
                     print(f"⚠️ Close order sent but position still {verified_qty} (attempt {attempt}/{max_retries})")
                     sys.stdout.flush()
                     if attempt < max_retries:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(5 * attempt)
 
             except Exception as e:
                 print(f"❌ Market close attempt {attempt} failed (reason: {reason}): {e}")
@@ -638,7 +646,7 @@ class LiveORBSignals:
                 self.record_rate_limit(e)
                 sys.stdout.flush()
                 if attempt < max_retries:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5 * attempt)
 
         print(f"❌ Market close FAILED after {max_retries} attempts (reason: {reason})")
         sys.stdout.flush()
@@ -702,7 +710,13 @@ class LiveORBSignals:
                 print(f"   Take Profit: {target:.2f} (RR: 1:{RISK_REWARD})")
                 sys.stdout.flush()
                 await asyncio.sleep(1.5)
-                live_qty = await self._get_position_qty()
+                try:
+                    live_qty = await self._get_position_qty()
+                except Exception as e:
+                    print(f"⚠️ Cannot get position qty after fill: {e} — using fill qty")
+                    self.record_rate_limit(e)
+                    sys.stdout.flush()
+                    live_qty = qty
                 if live_qty <= 0:
                     live_qty = qty
                 elif abs(live_qty - qty) > qty * 0.1:
@@ -863,9 +877,11 @@ class LiveORBSignals:
                 else:
                     print(f"⚠️ Breakeven SL failed: {be_err}")
                     sys.stdout.flush()
+                    new_sl = current_sl
             except Exception as e:
                 print(f"❌ Breakeven SL order error: {e}")
                 sys.stdout.flush()
+                new_sl = current_sl
 
         self.active_position['breakeven_triggered'] = breakeven_triggered
         self.active_position['sl'] = new_sl
