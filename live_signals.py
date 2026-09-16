@@ -1008,6 +1008,34 @@ class LiveORBSignals:
 
             if self.active_position:
                 try:
+                    pos_info = await self.client.futures_position_information(symbol=SYMBOL)
+                    position_exists = any(float(p['positionAmt']) != 0 for p in pos_info)
+
+                    if not position_exists:
+                        print(f"📴 Position already closed (SL/TP triggered). Clearing state.")
+                        sys.stdout.flush()
+                        entry_wallet = self.active_position.get('entry_wallet')
+                        if entry_wallet is not None:
+                            try:
+                                acc = await self.client.futures_account()
+                                current_wallet = float(acc['totalWalletBalance'])
+                                exit_pnl = round(current_wallet - entry_wallet, 2)
+                            except Exception:
+                                exit_pnl = 0.0
+                        else:
+                            exit_pnl = 0.0
+                        side = self.active_position['side']
+                        icon = "🟢" if exit_pnl >= 0 else "🔴"
+                        self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
+                        self.active_position = None
+                        if self.sl_order_id:
+                            await self.cancel_order(self.sl_order_id)
+                            self.sl_order_id = None
+                        if self.tp_order_id:
+                            await self.cancel_order(self.tp_order_id)
+                            self.tp_order_id = None
+                        return
+
                     open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
                     has_sl = any(o['type'] == 'STOP_MARKET' for o in open_orders)
                     has_tp = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in open_orders)
@@ -1019,7 +1047,7 @@ class LiveORBSignals:
                         except Exception:
                             pass
                     if not has_sl or not has_tp:
-                        print(f"🚨 Position has NO SL/TP protection! Closing immediately.")
+                        print(f"🚨 Position OPEN but NO SL/TP protection! Closing immediately.")
                         sys.stdout.flush()
                         self.notify(f"🚨 Position unprotected (SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'})\nClosing immediately")
                         await self.market_close_position(self.active_position['side'], reason="Position unprotected - no SL/TP")
@@ -1027,6 +1055,7 @@ class LiveORBSignals:
                 except Exception as e:
                     print(f"⚠️ SL/TP check error: {e}")
                     sys.stdout.flush()
+                    self.record_rate_limit(e)
                 await self.update_trailing_stop(high_price, low_price, close_price)
                 await self.check_position_status()
                 return
