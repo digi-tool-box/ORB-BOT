@@ -47,6 +47,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class LiveORBSignals:
+    STATE_FILE = "bot_state.json"
+
     def __init__(self):
         self.client = None
         self.bm = None
@@ -73,6 +75,47 @@ class LiveORBSignals:
         self._rate_limited_until = 0.0
         self._ban_logged_at = 0.0
         self._need_resync_on_ban_clear = False
+
+    def save_state(self):
+        """Persist critical state to disk so trailing stop survives restart."""
+        import json
+        state = {
+            'today': str(self.today) if self.today else None,
+            'daily_pnl': self.daily_pnl,
+            'trades_taken_today': self.trades_taken_today,
+            'active_position': self.active_position,
+        }
+        try:
+            with open(self.STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Failed to save state: {e}")
+            sys.stdout.flush()
+
+    def load_state(self):
+        """Restore critical state from disk after restart."""
+        import json
+        try:
+            if not os.path.exists(self.STATE_FILE):
+                return
+            with open(self.STATE_FILE, 'r') as f:
+                state = json.load(f)
+            saved_today = state.get('today')
+            if saved_today:
+                from datetime import date
+                self.today = date.fromisoformat(saved_today)
+            self.daily_pnl = state.get('daily_pnl', 0.0)
+            self.trades_taken_today = state.get('trades_taken_today', 0)
+            saved_pos = state.get('active_position')
+            if saved_pos:
+                print(f"📦 Restored active position from state: {saved_pos.get('side')} @ {saved_pos.get('entry')}")
+                sys.stdout.flush()
+            self.active_position = saved_pos
+            print(f"✅ State restored: today={self.today}, daily_pnl={self.daily_pnl}, trades={self.trades_taken_today}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"⚠️ Failed to load state: {e}")
+            sys.stdout.flush()
 
     def record_rate_limit(self, error):
         """Detect Binance -1003 rate-limit (IP ban) and store when REST may resume."""
@@ -603,6 +646,7 @@ class LiveORBSignals:
                         print(f"⚠️ Binance shows no position but active_position set — clearing (reason: {reason})")
                         sys.stdout.flush()
                         self.active_position = None
+                        self.save_state()
                     else:
                         print(f"ℹ️ No position to close (reason: {reason})")
                         sys.stdout.flush()
@@ -631,8 +675,21 @@ class LiveORBSignals:
                 if verified_qty <= 0:
                     print(f"✅ Position {qty} {side} CLOSED & VERIFIED (reason: {reason})")
                     sys.stdout.flush()
+                    if self.active_position:
+                        try:
+                            acc = await self.client.futures_account()
+                            current_wallet = float(acc['totalWalletBalance'])
+                            entry_wallet = self.active_position.get('entry_wallet')
+                            if entry_wallet is not None:
+                                exit_pnl = round(current_wallet - entry_wallet, 2)
+                            else:
+                                exit_pnl = 0.0
+                        except Exception:
+                            exit_pnl = 0.0
+                        self.daily_pnl += exit_pnl
                     self.active_position = None
-                    self.notify(f"✅ Position closed | {qty} {side} | {reason}")
+                    self.save_state()
+                    self.notify(f"✅ Position closed | {qty} {side} | {reason} | PnL: ${exit_pnl:.2f}")
                     return True
                 else:
                     print(f"⚠️ Close order sent but position still {verified_qty} (attempt {attempt}/{max_retries})")
@@ -754,6 +811,7 @@ class LiveORBSignals:
                     'breakeven_triggered': False,
                     'entry_wallet': entry_wallet
                 }
+                self.save_state()
                 order_id = self.pending_order_id
                 self.pending_order_id = None
                 self.trades_taken_today += 1
@@ -863,23 +921,22 @@ class LiveORBSignals:
                 await self.market_close_position(side, reason="Trailing SL would trigger immediately")
                 return
 
-            if self.sl_order_id:
-                await self.cancel_order(self.sl_order_id)
-
             close_side = 'SELL' if side == 'BUY' else 'BUY'
             try:
                 order_id, be_err = await self._place_exit_order(
                     close_side, 'STOP_MARKET', new_sl, current_qty)
                 if order_id is not None:
+                    if self.sl_order_id:
+                        await self.cancel_order(self.sl_order_id)
                     self.sl_order_id = order_id
                     print(f"✅ New SL at entry: {new_sl:.2f} (ID: {order_id})")
                     sys.stdout.flush()
                 else:
-                    print(f"⚠️ Breakeven SL failed: {be_err}")
+                    print(f"⚠️ Breakeven SL failed, keeping old SL: {be_err}")
                     sys.stdout.flush()
                     new_sl = current_sl
             except Exception as e:
-                print(f"❌ Breakeven SL order error: {e}")
+                print(f"❌ Breakeven SL order error, keeping old SL: {e}")
                 sys.stdout.flush()
                 new_sl = current_sl
 
@@ -887,6 +944,8 @@ class LiveORBSignals:
         self.active_position['sl'] = new_sl
         self.active_position['highest_high'] = pos.get('highest_high', pos['entry'])
         self.active_position['lowest_low'] = pos.get('lowest_low', pos['entry'])
+        if update_needed:
+            self.save_state()
 
     async def check_position_status(self):
         if not self.active_position:
@@ -925,8 +984,10 @@ class LiveORBSignals:
                         exit_pnl = 0.0
                     side = self.active_position['side']
                     icon = "🟢" if exit_pnl >= 0 else "🔴"
-                    self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
+                    self.daily_pnl += exit_pnl
+                    self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}\nDaily PnL: ${self.daily_pnl:.2f}")
                 self.active_position = None
+                self.save_state()
                 if self.sl_order_id:
                     await self.cancel_order(self.sl_order_id)
                     self.sl_order_id = None
@@ -986,6 +1047,7 @@ class LiveORBSignals:
                 self.breakout_done = {'BUY': False, 'SELL': False}
                 self.breakout_detected = {'BUY': False, 'SELL': False}
                 self.candles_today = []
+                self.save_state()
                 if self.pending_order_id:
                     await self.cancel_order(self.pending_order_id)
                     self.pending_order_id = None
@@ -1026,8 +1088,10 @@ class LiveORBSignals:
                             exit_pnl = 0.0
                         side = self.active_position['side']
                         icon = "🟢" if exit_pnl >= 0 else "🔴"
-                        self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
+                        self.daily_pnl += exit_pnl
+                        self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}\nDaily PnL: ${self.daily_pnl:.2f}")
                         self.active_position = None
+                        self.save_state()
                         if self.sl_order_id:
                             await self.cancel_order(self.sl_order_id)
                             self.sl_order_id = None
@@ -1472,6 +1536,7 @@ class LiveORBSignals:
                 except NotImplementedError:
                     pass
 
+            self.load_state()
             await self.recover_opening_range()
             await self.recover_active_position()
             await self.recover_trade_count()

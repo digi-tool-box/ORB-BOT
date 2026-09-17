@@ -13,8 +13,8 @@ INTERVAL = "5m"
 LEVERAGE = 2                # 2x leverage keeps position size within $100 capital on BTC
 
 # === Backtest period (UTC) ===
-START_DATE = "2024-01-01"
-END_DATE   = "2025-01-01"
+START_DATE = "2025-08-01"
+END_DATE   = "2026-08-01"
 
 # === Strategy parameters ===
 BREAKOUT_PCT = 0.5          # 0.5% candle range for valid breakout
