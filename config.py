@@ -57,8 +57,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # @userinfobot se lo
 # === RATE-LIMIT SAFETY ===
 # Shared-IP hosts (Render) trigger Binance -1003 bans from neighbors. Keep REST
 # light and desynchronized so our own polls don't collide/extend bans.
-FILL_CHECK_INTERVAL_SECONDS = 30    # min seconds between pending-order REST checks
-FILL_CHECK_JITTER_SECONDS = 5       # +random jitter to avoid syncing with neighbors
+FILL_CHECK_INTERVAL_SECONDS = 60    # min seconds between pending-order REST checks (raised from 30)
+FILL_CHECK_JITTER_SECONDS = 15      # +random jitter to avoid syncing with neighbors (raised from 5)
 
 # === DEBUG & LOGGING ===
 DEBUG_MODE = True           # set False to silence debug prints

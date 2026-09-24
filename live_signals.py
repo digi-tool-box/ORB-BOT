@@ -777,9 +777,12 @@ class LiveORBSignals:
                 if live_qty <= 0:
                     live_qty = qty
                 elif abs(live_qty - qty) > qty * 0.1:
-                    print(f"⚠️ Position qty ({live_qty}) differs from fill qty ({qty}) — using fill qty")
+                    # Position qty differs from fill qty (e.g. leftover from prior trade).
+                    # Use the LARGER qty so SL/TP covers the ENTIRE position.
+                    # Using fill qty here left 0.082 BTC unprotected (24 Sep log bug).
+                    print(f"⚠️ Position qty ({live_qty}) differs from fill qty ({qty}) — using LIVE qty for full SL/TP coverage")
                     sys.stdout.flush()
-                    live_qty = qty
+                    live_qty = max(live_qty, qty)
                 sl_placed, tp_placed = await self.place_exit_orders(side, stop, target, live_qty)
                 if not sl_placed and not tp_placed:
                     print("🚨 CRITICAL: Both SL and TP failed! Checking if position still open...")
@@ -1100,7 +1103,25 @@ class LiveORBSignals:
                             self.tp_order_id = None
                         return
 
-                    open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+                    # If rate-limited, SKIP the SL/TP check entirely.
+                    # A -1003 ban makes open_orders return empty/incomplete data,
+                    # which would be wrongly interpreted as "no SL/TP" and force-close
+                    # a healthy position (bug seen in 24 Sep log).
+                    if self.is_rate_limited():
+                        print("⏸️ Rate-limited — skipping SL/TP check this candle (position stays open)")
+                        sys.stdout.flush()
+                        return
+
+                    try:
+                        open_orders = await self.client.futures_get_open_orders(symbol=SYMBOL)
+                    except Exception as order_err:
+                        self.record_rate_limit(order_err)
+                        if self.is_rate_limited():
+                            print(f"⏸️ Rate-limited during SL/TP fetch — skipping check (NOT closing): {order_err}")
+                            sys.stdout.flush()
+                            return
+                        raise
+
                     has_sl = any(o['type'] == 'STOP_MARKET' for o in open_orders)
                     has_tp = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in open_orders)
                     if not has_sl or not has_tp:
@@ -1109,13 +1130,23 @@ class LiveORBSignals:
                             has_sl = has_sl or any(o.get('orderType') == 'STOP_MARKET' for o in algo_orders)
                             has_tp = has_tp or any(o.get('orderType') == 'TAKE_PROFIT_MARKET' for o in algo_orders)
                         except Exception:
-                            pass
+                            # Cannot verify algo orders — do NOT force-close on uncertainty
+                            if self.is_rate_limited():
+                                print("⏸️ Rate-limited during algo order check — skipping (NOT closing)")
+                                sys.stdout.flush()
+                                return
                     if not has_sl or not has_tp:
-                        print(f"🚨 Position OPEN but NO SL/TP protection! Closing immediately.")
-                        sys.stdout.flush()
-                        self.notify(f"🚨 Position unprotected (SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'})\nClosing immediately")
-                        await self.market_close_position(self.active_position['side'], reason="Position unprotected - no SL/TP")
-                        return
+                        # Double-check: if we have stored order IDs, trust them over a
+                        # possibly-stale API response (e.g. during rate-limit recovery)
+                        if self.sl_order_id and self.tp_order_id and not self.is_rate_limited():
+                            print("⚠️ API shows no SL/TP but stored order IDs exist — trusting stored IDs, skipping close")
+                            sys.stdout.flush()
+                        else:
+                            print(f"🚨 Position OPEN but NO SL/TP protection! Closing immediately.")
+                            sys.stdout.flush()
+                            self.notify(f"🚨 Position unprotected (SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'})\nClosing immediately")
+                            await self.market_close_position(self.active_position['side'], reason="Position unprotected - no SL/TP")
+                            return
                 except Exception as e:
                     print(f"⚠️ SL/TP check error: {e}")
                     sys.stdout.flush()
