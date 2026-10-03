@@ -675,6 +675,7 @@ class LiveORBSignals:
                 if verified_qty <= 0:
                     print(f"✅ Position {qty} {side} CLOSED & VERIFIED (reason: {reason})")
                     sys.stdout.flush()
+                    exit_pnl = 0.0
                     if self.active_position:
                         try:
                             acc = await self.client.futures_account()
@@ -682,11 +683,12 @@ class LiveORBSignals:
                             entry_wallet = self.active_position.get('entry_wallet')
                             if entry_wallet is not None:
                                 exit_pnl = round(current_wallet - entry_wallet, 2)
-                            else:
-                                exit_pnl = 0.0
                         except Exception:
                             exit_pnl = 0.0
                         self.daily_pnl += exit_pnl
+                    icon = "🟢" if exit_pnl >= 0 else "🔴"
+                    print(f"{icon} Position closed ({reason}) | PnL: ${exit_pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                    sys.stdout.flush()
                     self.active_position = None
                     self.save_state()
                     self.notify(f"✅ Position closed | {qty} {side} | {reason} | PnL: ${exit_pnl:.2f}")
@@ -988,6 +990,8 @@ class LiveORBSignals:
                     side = self.active_position['side']
                     icon = "🟢" if exit_pnl >= 0 else "🔴"
                     self.daily_pnl += exit_pnl
+                    print(f"{icon} TRADE CLOSED | {side} {SYMBOL} | PnL: ${exit_pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                    sys.stdout.flush()
                     self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}\nDaily PnL: ${self.daily_pnl:.2f}")
                 self.active_position = None
                 self.save_state()
@@ -1092,6 +1096,8 @@ class LiveORBSignals:
                         side = self.active_position['side']
                         icon = "🟢" if exit_pnl >= 0 else "🔴"
                         self.daily_pnl += exit_pnl
+                        print(f"{icon} TRADE CLOSED | {side} {SYMBOL} | PnL: ${exit_pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                        sys.stdout.flush()
                         self.notify(f"{icon} TRADE CLOSED | {side} {SYMBOL}\nPnL: ${exit_pnl:.2f}\nDaily PnL: ${self.daily_pnl:.2f}")
                         self.active_position = None
                         self.save_state()
@@ -1350,7 +1356,8 @@ class LiveORBSignals:
             traceback.print_exc()
             sys.stdout.flush()
 
-    async def recover_active_position(self):
+    async def recover_active_position(self, attempt=1, max_retries=3):
+        """Recover open position from exchange. Returns True when state is known."""
         try:
             print("🔍 Checking for open positions on Binance Futures...")
             sys.stdout.flush()
@@ -1415,7 +1422,7 @@ class LiveORBSignals:
                     self.notify(f"🚨 Recovered {side} position with incomplete SL/TP\nClosing to prevent loss")
                     self.pending_order_id = None
                     await self.market_close_position(side, reason="Recovered with incomplete SL/TP")
-                    return
+                    return True
 
                 # Only if both orders exist, restore active_position
                 self.sl_order_id = sl_order_id
@@ -1433,12 +1440,45 @@ class LiveORBSignals:
             else:
                 print("ℹ️ No active positions found")
                 sys.stdout.flush()
+                if self.active_position:
+                    # State file has a position but exchange is flat — exchange is truth.
+                    stale = self.active_position
+                    entry_wallet = stale.get('entry_wallet')
+                    exit_pnl = 0.0
+                    if entry_wallet is not None:
+                        try:
+                            acc = await self.client.futures_account()
+                            exit_pnl = round(float(acc['totalWalletBalance']) - entry_wallet, 2)
+                        except Exception:
+                            exit_pnl = 0.0
+                    self.daily_pnl += exit_pnl
+                    icon = "🟢" if exit_pnl >= 0 else "🔴"
+                    print(f"{icon} Stale position cleared (exchange is flat) | {stale.get('side')} @ {stale.get('entry')} | PnL: ${exit_pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                    sys.stdout.flush()
+                    self.notify(f"{icon} Stale position cleared | {stale.get('side')} {SYMBOL}\nPnL: ${exit_pnl:.2f}")
+                    self.active_position = None
+                    self.save_state()
+            return True
 
         except Exception as e:
-            print(f"⚠️ Error recovering active position: {e}")
+            self.record_rate_limit(e)
+            print(f"⚠️ Error recovering active position (attempt {attempt}/{max_retries}): {e}")
             sys.stdout.flush()
+            if attempt < max_retries:
+                wait = 20 * attempt
+                if self.is_rate_limited():
+                    wait = max(wait, int(self._rate_limited_until - time.time()) + 5)
+                print(f"⏳ Retrying position recovery in {wait}s...")
+                sys.stdout.flush()
+                await asyncio.sleep(wait)
+                return await self.recover_active_position(attempt + 1, max_retries)
+            print("🚨 Position recovery FAILED — bot cannot see open positions!")
+            sys.stdout.flush()
+            self.notify("🚨 Position recovery failed — bot may be blind to open positions")
+            return False
 
-    async def recover_pending_orders(self):
+    async def recover_pending_orders(self, attempt=1, max_retries=3):
+        """Recover pending LIMIT entry from exchange. Returns True when state is known."""
         try:
             print("🔍 Checking for pending LIMIT orders...")
             sys.stdout.flush()
@@ -1454,7 +1494,7 @@ class LiveORBSignals:
                         sys.stdout.flush()
                         await self.cancel_order(self.pending_order_id)
                         self.pending_order_id = None
-                        return
+                        return True
                     if self.pending_order_side == 'BUY':
                         self.pending_stop_level = self.or_low
                         side_print = 'BUY'
@@ -1463,11 +1503,63 @@ class LiveORBSignals:
                         side_print = 'SELL'
                     print(f"📌 Recovered pending LIMIT {side_print} order {self.pending_order_id} @ {self.pending_entry_level:.2f}")
                     sys.stdout.flush()
-                    return
+                    return True
             print("ℹ️ No pending LIMIT orders found")
             sys.stdout.flush()
+            return True
         except Exception as e:
-            print(f"⚠️ Error recovering pending orders: {e}")
+            self.record_rate_limit(e)
+            print(f"⚠️ Error recovering pending orders (attempt {attempt}/{max_retries}): {e}")
+            sys.stdout.flush()
+            if attempt < max_retries:
+                wait = 20 * attempt
+                if self.is_rate_limited():
+                    wait = max(wait, int(self._rate_limited_until - time.time()) + 5)
+                print(f"⏳ Retrying pending-order recovery in {wait}s...")
+                sys.stdout.flush()
+                await asyncio.sleep(wait)
+                return await self.recover_pending_orders(attempt + 1, max_retries)
+            print("🚨 Pending-order recovery FAILED — stale orders may be missed!")
+            sys.stdout.flush()
+            self.notify("🚨 Pending-order recovery failed (rate-limited)")
+            return False
+
+    async def cleanup_orphan_exit_orders(self):
+        """Cancel leftover STOP/TP orders when exchange shows no position.
+
+        Called only after BOTH position and pending-order recovery succeeded —
+        otherwise a live position's protection could be cancelled by mistake.
+        """
+        if self.active_position:
+            return
+        try:
+            print("🧹 Checking for orphan SL/TP orders (no open position)...")
+            sys.stdout.flush()
+            orphan_ids = []
+            for o in await self.client.futures_get_open_orders(symbol=SYMBOL):
+                if o['type'] in ('STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT'):
+                    orphan_ids.append(o['orderId'])
+            try:
+                algo_orders = await self.client._request_futures_api('get', 'openAlgoOrders', True, data={'symbol': SYMBOL})
+                for o in algo_orders:
+                    if o.get('orderType') in ('STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT'):
+                        oid = o.get('algoId')
+                        if oid is not None and oid not in orphan_ids:
+                            orphan_ids.append(oid)
+            except Exception:
+                pass
+            if orphan_ids:
+                for oid in orphan_ids:
+                    print(f"🧹 Cancelling orphan exit order {oid} (position is flat — nothing to protect)")
+                    sys.stdout.flush()
+                    await self.cancel_order(oid)
+                self.notify(f"🧹 Cancelled {len(orphan_ids)} orphan SL/TP order(s) at startup")
+            else:
+                print("ℹ️ No orphan exit orders found")
+                sys.stdout.flush()
+        except Exception as e:
+            self.record_rate_limit(e)
+            print(f"⚠️ Orphan order cleanup failed: {e}")
             sys.stdout.flush()
 
     async def recover_trade_count(self):
@@ -1569,9 +1661,14 @@ class LiveORBSignals:
 
             self.load_state()
             await self.recover_opening_range()
-            await self.recover_active_position()
+            pos_ok = await self.recover_active_position()
             await self.recover_trade_count()
-            await self.recover_pending_orders()
+            pend_ok = await self.recover_pending_orders()
+            if pos_ok and pend_ok:
+                await self.cleanup_orphan_exit_orders()
+            else:
+                print("⚠️ Skipping orphan-order cleanup — recovery incomplete, order state unknown")
+                sys.stdout.flush()
 
             balance = await self.get_usdt_balance()
             print(f"💰 Account Balance: {balance:.2f} USDT")
