@@ -72,6 +72,7 @@ class LiveORBSignals:
         self._shutdown_requested = False
         self.daily_pnl = 0.0
         self.max_daily_loss_pct = 20.0
+        self.last_known_balance = 0.0
         self._rate_limited_until = 0.0
         self._ban_logged_at = 0.0
         self._need_resync_on_ban_clear = False
@@ -200,6 +201,7 @@ class LiveORBSignals:
         try:
             acc = await self.client.futures_account()
             balance = float(acc['availableBalance'])
+            self.last_known_balance = balance
             print(f"💰 Available USDT Balance: {balance}")
             sys.stdout.flush()
             return balance
@@ -207,7 +209,11 @@ class LiveORBSignals:
             print(f"⚠️ Balance fetch error: {e}")
             sys.stdout.flush()
             self.record_rate_limit(e)
-        return INITIAL_CAPITAL
+            if self.last_known_balance > 0:
+                print(f"↩️ Using last known balance: {self.last_known_balance:.2f} USDT")
+                sys.stdout.flush()
+                return self.last_known_balance
+        return 0.0
 
     def calculate_quantity(self, entry, stop, side, balance):
         max_margin_use = balance * 0.98
@@ -1193,11 +1199,15 @@ class LiveORBSignals:
             if self.trades_taken_today >= MAX_TRADES_PER_DAY:
                 return
 
-            max_daily_loss = INITIAL_CAPITAL * (self.max_daily_loss_pct / 100)
-            if self.daily_pnl <= -max_daily_loss:
-                print(f"🚫 Max daily loss ({self.max_daily_loss_pct}%) reached. Stopping trading for the day.")
-                sys.stdout.flush()
-                return
+            bal = self.last_known_balance
+            if bal <= 0:
+                bal = await self.get_usdt_balance()
+            if bal > 0:
+                max_daily_loss = bal * (self.max_daily_loss_pct / 100)
+                if self.daily_pnl <= -max_daily_loss:
+                    print(f"🚫 Max daily loss ({self.max_daily_loss_pct}% = ${max_daily_loss:.2f} of ${bal:.2f}) reached. Stopping trading for the day.")
+                    sys.stdout.flush()
+                    return
 
             last = self.candles_today[-1]
             close = last['close']
